@@ -7,7 +7,7 @@
 \usepackage{graphicx}
 \usepackage[hidelinks]{hyperref}
 
-\title{Coronary Artery Segmentation with SegMamba:\\A Practical Replication Under Single-GPU Constraints}
+\title{Coronary Artery Segmentation with SegMamba:\\A Practical Task-Transfer Evaluation Under Single-GPU Constraints}
 
 \author{
 \IEEEauthorblockN{Lars Talian Stangebye-Hansen and Oliver Sanchez}
@@ -22,7 +22,7 @@ Trondheim, Norway
 \maketitle
 
 \begin{abstract}
-This paper reports a focused replication study on coronary artery segmentation using modern Mamba-based models. The work was motivated by the recent release of SegMamba and the question of whether it improves segmentation quality in this specific task under realistic constraints. We compare three model families on the same ASOCA-style workflow: a U-Net baseline, a Mamba-encoder variant, and the SegMamba architecture as released by the original authors, trained through our task-specific pipeline. Mean validation Dice was 0.7844 (U-Net), 0.7734 (Mamba-encoder), and 0.7673 (SegMamba). The key finding is practical: in our setup, optimization stability and patch strategy were more decisive than architectural novelty. Experiments were compute-limited to a single A100 GPU, which constrained sweep depth and prevented exhaustive task-specific hyperparameter tuning.
+This paper reports a focused task-transfer evaluation of coronary artery segmentation using modern Mamba-based models. The work was motivated by the recent release of SegMamba and the question of whether it improves segmentation quality in this specific task under realistic constraints. We compare three model families on the same ASOCA-style workflow: a U-Net baseline, a Mamba-encoder variant, and the SegMamba architecture as released by the original authors, trained through our task-specific pipeline. Mean validation Dice was 0.7844 (U-Net), 0.7734 (Mamba-encoder), and 0.7673 (SegMamba). The key finding is practical: in our setup, optimization stability and patch strategy were more decisive than architectural novelty. Experiments were compute-limited to a single A100 GPU, which constrained sweep depth and prevented exhaustive task-specific hyperparameter tuning.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -84,12 +84,12 @@ U-Net was strongest in this regime. Mamba-based models were competitive but did 
 \centering
 \includegraphics[width=0.49\textwidth]{figures/training_curve_legacy.png}\hfill
 \includegraphics[width=0.49\textwidth]{figures/qualitative_pred_vs_gt.png}
-\caption{Legacy evidence from the SegMamba pipeline used in this replication. Left: training dynamics (loss and validation Dice) under single-GPU constraints. Right: representative SegMamba prediction versus ground-truth mask.}
+\caption{Legacy evidence from the SegMamba pipeline used in this study. Left: training dynamics (loss and validation Dice) under single-GPU constraints. Right: representative SegMamba prediction versus ground-truth mask.}
 \label{fig:legacy_evidence}
 \end{figure*}
 
 \section{Discussion}
-The negative result versus U-Net should not be interpreted as evidence against SegMamba in general. In this setup, the most likely bottlenecks were optimization and scale rather than representational ceiling: higher sensitivity to hyperparameters, patch-policy effects on continuity learning, and limited sweep breadth under a single-GPU budget. Given differences in data protocol, optimizer/loss recipe, and compute scale relative to SegMamba's reported setting \cite{xing2024segmamba}, this result should be treated as a constrained task-specific replication rather than a direct leaderboard comparison. The legacy evidence in Fig.~\ref{fig:legacy_evidence} is consistent with this interpretation: optimization remains stable, qualitative outputs are reasonable, but validation improvements flatten under constrained search budget. In short, our intent was to explore SegMamba early on this domain; we obtained a stable and comparable result, but not a new best score.
+The negative result versus U-Net should not be interpreted as evidence against SegMamba in general. In this setup, the most likely bottlenecks were optimization and scale rather than representational ceiling: higher sensitivity to hyperparameters, patch-policy effects on continuity learning, and limited sweep breadth under a single-GPU budget. Given differences in data protocol, optimizer/loss recipe, and compute scale relative to SegMamba's reported setting \cite{xing2024segmamba}, this result should be treated as a constrained task-transfer evaluation rather than a direct leaderboard comparison. The legacy evidence in Fig.~\ref{fig:legacy_evidence} is consistent with this interpretation: optimization remains stable, qualitative outputs are reasonable, and validation improvements flatten under a constrained search budget. In short, our intent was to explore SegMamba early on this domain; we obtained a stable and comparable result, but not a new best score.
 
 \section{Limitations and Next Steps}
 This is a validation-centric study and not a benchmark submission. We also did not run exhaustive task-specific hyperparameter searches for SegMamba due to the single-GPU compute budget. The primary run profile was: 1$\times$A100, patch size 224$\times$224$\times$96, batch size 1, 120 epochs, validation every 5 epochs, and mixed precision training. The most valuable next steps are overlap-aware patching, structured sweeps on patch/loss parameters, threshold calibration per volume, and experiments on larger datasets where long-range modeling may provide larger gains.
