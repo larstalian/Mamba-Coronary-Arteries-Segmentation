@@ -1,31 +1,53 @@
+import os
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+import tempfile
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn import functional as F
+import torch.optim as optim
+from monai.transforms import (
+    Compose, LoadImaged, ScaleIntensityd, EnsureTyped, EnsureChannelFirstd,
+    Orientationd, Spacingd
+)
+from monai.data import DataLoader, Dataset, partition_dataset
+from monai.config import print_config
 from model_segmamba.segmamba import SegMamba
-from blackmamba.asoca_dataset import MedicalImageDataset
-import os
+from torch.optim import Adam
+
 
 # Configuration
 root_dir = '/datasets/tdt4265/mic/asoca'
 num_epochs = 50
-batch_size = 4
+batch_size = 1
 learning_rate = 0.001
 
-# Setup TensorBoard
+# Define MONAI transforms with additional transformations for 3D images
+transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    ScaleIntensityd(keys=["image"]),
+    EnsureTyped(keys=["image", "label"]),
+])
+# Prepare dataset and dataloader
+data_dicts = [{
+    'image': os.path.join(root_dir, 'CTCA', f'{i}.nrrd'),
+    'label': os.path.join(root_dir, 'Annotations', f'{i}_seg.nrrd')
+} for i in range(1, 20)]
+
+train_files, val_files = partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
+
+train_ds = Dataset(data=train_files, transform=transforms)
+val_ds = Dataset(data=val_files, transform=transforms)
+
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+
+# Model setup
+model = SegMamba(in_chans=1, out_chans=4, depths=[2,2,2,2], feat_size=[48, 96, 192, 384]).cuda()
+optimizer = Adam(model.parameters(), lr=learning_rate)
 writer = SummaryWriter()
-
-# Dataset and DataLoader
-dataset = MedicalImageDataset(root_dir=root_dir)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-# Model
-model = SegMamba(in_chans=4, out_chans=4, depths=[2,2,2,2], feat_size=[48, 96, 192, 384]).cuda()
 
 # Loss Function
 def dice_loss(pred, target, smooth=1.):
