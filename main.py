@@ -18,10 +18,11 @@ import monai
 
 
 # Configuration
-root_dir = '/datasets/tdt4265/mic/asoca'
-num_epochs = 3
-batch_size = 1
-learning_rate = 0.001
+# root_dir = '/datasets/tdt4265/mic/asoca'
+root_dir = '/cluster/projects/vc/data/mic/open/Heart/ASOCA'
+num_epochs = 100
+batch_size = 4
+learning_rate = 0.0002
 
 # Define MONAI transforms with additional transformations for 3D images
 transforms = Compose([
@@ -29,8 +30,7 @@ transforms = Compose([
     EnsureChannelFirstd(keys=["image", "label"]),
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     ScaleIntensityd(keys=["image"]),
-    CenterSpatialCropd(keys=["image", "label"], roi_size=[32, 64, 64]),  # Crop the image
-
+    # CenterSpatialCropd(keys=["image", "label"], roi_size=[32, 64, 64]),  # Crop the image
     EnsureTyped(keys=["image", "label"]),
 ])
 # Prepare dataset and dataloader
@@ -91,7 +91,7 @@ def run_epoch(loader, is_training=True):
 
        # print('s')
         outputs = model(inputs)
-        print('s')
+        # print('s')
         loss = dice_loss(outputs, labels)
         labels = labels.squeeze(1)
         F.cross_entropy(outputs, labels)
@@ -117,7 +117,7 @@ for epoch in range(num_epochs):
     # Save the model if validation loss has decreased
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        torch.save(model.state_dict(), 'best_model.pth')
+        torch.save(model.state_dict(), 'best_model2.pth')
         print(f'Saved Best Model at Epoch {epoch+1}')
 
     print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}')
