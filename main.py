@@ -8,17 +8,18 @@ from torch.nn import functional as F
 import torch.optim as optim
 from monai.transforms import (
     Compose, LoadImaged, ScaleIntensityd, EnsureTyped, EnsureChannelFirstd,
-    Orientationd, Spacingd
+    Orientationd, Spacingd, CenterSpatialCropd
 )
 from monai.data import DataLoader, Dataset, partition_dataset
 from monai.config import print_config
 from model_segmamba.segmamba import SegMamba
 from torch.optim import Adam
+import monai
 
 
 # Configuration
 root_dir = '/datasets/tdt4265/mic/asoca'
-num_epochs = 50
+num_epochs = 3
 batch_size = 1
 learning_rate = 0.001
 
@@ -28,12 +29,14 @@ transforms = Compose([
     EnsureChannelFirstd(keys=["image", "label"]),
     Orientationd(keys=["image", "label"], axcodes="RAS"),
     ScaleIntensityd(keys=["image"]),
+    CenterSpatialCropd(keys=["image", "label"], roi_size=[32, 64, 64]),  # Crop the image
+
     EnsureTyped(keys=["image", "label"]),
 ])
 # Prepare dataset and dataloader
 data_dicts = [{
-    'image': os.path.join(root_dir, 'CTCA', f'{i}.nrrd'),
-    'label': os.path.join(root_dir, 'Annotations', f'{i}_seg.nrrd')
+    'image': os.path.join(root_dir, 'Diseased/CTCA', f'Diseased_{i}.nrrd'),
+    'label': os.path.join(root_dir, 'Diseased/Annotations', f'Diseased_{i}.nrrd')
 } for i in range(1, 20)]
 
 train_files, val_files = partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
@@ -70,13 +73,29 @@ def run_epoch(loader, is_training=True):
     
     for data in loader:
         inputs, labels = data
+      #  print("Batch data keys:", data.keys())  # Should print: dict_keys(['image', 'label'])
+        inputs, labels = data['image'], data['label']
+      #  print("Inputs type before cuda:", type(inputs))  # Should be <class 'torch.Tensor'>
+       # print("Labels type before cuda:", type(labels))  # Should be <class 'torch.Tensor'>
+
+        #print(inputs)
         inputs, labels = inputs.cuda(), labels.cuda()
+      #  if isinstance(labels, monai.data.meta_tensor.MetaTensor):
+       #     labels = labels.tensor
 
         if is_training:
             optimizer.zero_grad()
 
+      #  labels = labels.long()  # Cast labels to long
+        labels = labels.to(dtype=torch.long)  # Cast labels to long
+
+       # print('s')
         outputs = model(inputs)
-        loss = dice_loss(outputs, labels) + F.cross_entropy(outputs, labels)
+        print('s')
+        loss = dice_loss(outputs, labels)
+        labels = labels.squeeze(1)
+        F.cross_entropy(outputs, labels)
+        loss += F.cross_entropy(outputs, labels)
         if is_training:
             loss.backward()
             optimizer.step()
