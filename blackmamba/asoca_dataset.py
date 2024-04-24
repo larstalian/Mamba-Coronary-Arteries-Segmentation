@@ -35,6 +35,7 @@ class MedicalImageDataset(Dataset):
 
     def __getitem__(self, idx):
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
         image_path, label_path = self.samples[idx]
         image, _ = nrrd.read(image_path)
         print(image.shape)
@@ -58,6 +59,8 @@ def pad_image(img, target_shape):
     return img_padded
 
 =======
+=======
+>>>>>>> Stashed changes
         data = self.samples[idx]
         data = self.transform(data)
         return data['image'], data['label']
@@ -70,4 +73,7 @@ def pad_image(tensor, target_shape):
                0, max(target_shape[0] - d, 0)]  # pad depth
     tensor_padded = F.pad(tensor, padding, "constant", 0)
     return tensor_padded
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
