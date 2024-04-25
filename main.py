@@ -1,23 +1,18 @@
 import os
-
-import numpy as np
 import torch
-from monai.data import DataLoader, partition_dataset, SmartCacheDataset
-from monai.engines import SupervisedTrainer, SupervisedEvaluator
-from monai.handlers import EarlyStopHandler, CheckpointSaver, LrScheduleHandler, ValidationHandler, MeanDice
-from monai.losses import DiceLoss
-from monai.inferers import SlidingWindowInferer
-from monai.metrics import DiceMetric
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn import functional as F
 from monai.transforms import (
-    Compose, LoadImaged, EnsureChannelFirstd, Orientationd, ScaleIntensityd, RandFlipd, RandRotated,
-    RandShiftIntensityd, CenterSpatialCropd, EnsureTyped
+    Compose, LoadImaged, ScaleIntensityd, EnsureTyped, EnsureChannelFirstd,
+    Orientationd, Spacingd, CenterSpatialCropd,SpatialPadd, RandFlipd, RandRotated, RandSpatialCropd, RandShiftIntensityd, SpatialCropd
 )
-from torch.optim import Adam
-
+from monai.data import DataLoader, Dataset, partition_dataset
+from monai.config import print_config
 from model_segmamba.segmamba import SegMamba
-
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = True
+from torch.cuda.amp import GradScaler, autocast
+from monai.data import SmartCacheDataset
+import nrrd
 
 # Configuration
 root_dir = '/datasets/tdt4265/mic/asoca'
@@ -25,6 +20,7 @@ root_dir = '/datasets/tdt4265/mic/asoca'
 num_epochs = 100
 batch_size = 1
 learning_rate = 0.0001
+
 
 transforms = Compose([
     LoadImaged(keys=["image", "label"]),
@@ -45,7 +41,9 @@ transforms = Compose([
         dtype=np.float32
     ),
     RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
-    CenterSpatialCropd(keys=["image", "label"], roi_size=[128, 128, 128]),  # Center padding for cybele computer
+    # CenterSpatialCropd(keys=["image", "label"], roi_size=[128, 128, 128]), # Center padding for cybele computer
+    SpatialCropd(keys=["image", "label"], roi_start=[100, 120, 80], roi_end=[228, 248, 208]), 
+
     # SpatialPadd(keys=["image", "label"], spatial_size=(512, 512, 224)),  # Padding (already included)
     EnsureTyped(keys=["image", "label"]),
 ])
@@ -62,58 +60,237 @@ train_files, val_files = partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffl
 cache_num_train = min(10 * batch_size, len(train_files) - 1)
 cache_num_val = min(5 * batch_size, len(val_files) - 1)
 
-train_ds = SmartCacheDataset(data=train_files, transform=transforms, replace_rate=0.2, cache_num=cache_num_train,
-                             num_init_workers=4, num_replace_workers=4)
-val_ds = SmartCacheDataset(data=val_files, transform=transforms, replace_rate=0.2, cache_num=cache_num_val,
-                           num_init_workers=2, num_replace_workers=2)
+train_ds = SmartCacheDataset(data=train_files, transform=transforms, replace_rate=0.2, cache_num=cache_num_train, num_init_workers=4, num_replace_workers=4)
+val_ds = SmartCacheDataset(data=val_files, transform=transforms, replace_rate=0.2, cache_num=cache_num_val, num_init_workers=2, num_replace_workers=2)
 
 train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=6)
 val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=6)
 
-model = SegMamba(in_chans=1, out_chans=4, depths=[2,2,2,2], feat_size=[48, 96, 192, 384]).cuda()
-loss_function = DiceLoss(to_onehot_y=True, sigmoid=True, squared_pred=True)
-optimizer = Adam(model.parameters(), lr=0.0001)
+# Model setup
+model = SegMamba(in_chans=1, out_chans=1, depths=[2,2,2,2], feat_size=[48, 96, 192, 384]).cuda()
 
-# Metrics
-dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
+warmup_epochs = 10
+warmup_start_lr = 0.001  # Start with a very low learning rate
+base_lr = learning_rate  # Target learning rate after warm-up
 
-# Handlers for evaluation
-val_handlers = [
-    EarlyStopHandler(patience=10, score_function=lambda x: -x['Mean_Dice'], trainer=None)  # Placeholder for trainer
-]
+writer = SummaryWriter()
 
-# Define the evaluator first
-val_evaluator = SupervisedEvaluator(
-    device=torch.device("cuda:0"),
-    val_data_loader=val_loader,
-    network=model,
-    key_val_metric={"Mean_Dice": MeanDice(dice_metric)},  # Correctly wrapped metric
-    inferer=SlidingWindowInferer(),
-    val_handlers=val_handlers
-)
+# Modify the optimizer setup to start with a lower learning rate
+optimizer = torch.optim.Adam(model.parameters(), lr=warmup_start_lr)
+scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.1)
 
-# Update trainer placeholder in EarlyStopHandler
+# early_stopping = EarlyStopping(patience=10, verbose=True)
 
-# Train handlers
-train_handlers = [
-    LrScheduleHandler(lr_scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.1), print_lr=True),
-    ValidationHandler(validator=val_evaluator, interval=1, epoch_level=True),
-    CheckpointSaver(save_dir="./", save_dict={"model": model}, save_key_metric=True)
-]
 
-# Create the trainer with the correct reference to the evaluator
-trainer = SupervisedTrainer(
-    device=torch.device("cuda:0"),
-    max_epochs=num_epochs,
-    train_data_loader=train_loader,
-    network=model,
-    optimizer=optimizer,
-    loss_function=loss_function,
-    inferer=SlidingWindowInferer(),
-    key_train_metric={"Mean_Dice": MeanDice(dice_metric)},  # Correctly wrapped metric
-    train_handlers=train_handlers
-)
-val_handlers[0].trainer = trainer
+def log_memory():
+    print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
-# Start training
-trainer.run()
+def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_start_lr):
+    if epoch < warmup_epochs:
+        lr = warmup_start_lr + (base_lr - warmup_start_lr) * (epoch / warmup_epochs)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+def sigmoid_activation(x):
+    return torch.sigmoid(x)
+
+def dice_coefficient(pred, target, smooth=1.):
+    pred = sigmoid_activation(pred)  # Convert logits to probabilities
+    pred = (pred > 0.5).float()  # Threshold probabilities to get binary predictions
+    intersection = (pred * target).sum(dim=(2, 3, 4))
+    union = pred.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return dice.mean()
+
+def dice_loss(pred, target, smooth=1.):
+    pred = torch.sigmoid(pred)  # Sigmoid to convert logits to probabilities
+    pred = (pred > 0.5).float()  # Threshold probabilities to get binary predictions
+    intersection = (pred * target).sum(dim=(2, 3, 4))
+    union = pred.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
+
+
+def save_checkpoint(state, filename="checkpoint.pth.tar"):
+    torch.save(state, filename)
+
+def load_checkpoint(filename="checkpoint.pth.tar"):
+    state = torch.load(filename)
+    model.load_state_dict(state['state_dict'])
+    optimizer.load_state_dict(state['optimizer'])
+    return state['epoch'], state['best_val_loss']
+
+# Helper function to perform a training or validation epoch
+
+def run_epoch(loader, is_training=True):
+    epoch_loss = 0.0
+    epoch_dice = 0.0
+    scaler = GradScaler()  # Initialize the gradient scaler
+
+    if is_training:
+        model.train()
+    else:
+        model.eval()
+
+    for data in loader:
+        inputs, labels = data['image'], data['label']
+        inputs, labels = inputs.cuda(), labels.cuda()
+        labels = labels.to(dtype=torch.long)
+
+        if is_training:
+            optimizer.zero_grad()
+
+        # Using automatic mixed precision
+        with autocast():
+            outputs = model(inputs)
+            dice_loss_val = dice_loss(outputs, labels)  # Calculate Dice loss
+            bce_loss = F.binary_cross_entropy_with_logits(outputs, labels.float())  # Calculate BCE loss
+            loss = dice_loss_val + bce_loss  # Combine losses
+        if not is_training:
+            with autocast():
+                dice = dice_coefficient(outputs, labels)  # Compute the Dice coefficient
+            epoch_dice += dice.item()
+
+        if is_training:
+            # Backward pass with automatic mixed precision
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Log gradient norms to TensorBoard
+            total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None]), 2)
+            writer.add_scalar('Gradient_norm', total_norm, epoch)
+
+        epoch_loss += loss.item()
+
+    # Calculate average loss and Dice for the epoch
+    num_batches = len(loader)
+    avg_epoch_loss = epoch_loss / num_batches
+    if not is_training:
+        avg_epoch_dice = epoch_dice / num_batches
+        return avg_epoch_loss, avg_epoch_dice
+    else:
+        return avg_epoch_loss
+
+
+# Training and Validation Loop
+best_val_loss = float('inf')
+best_val_dice = 0.0
+
+for epoch in range(num_epochs):
+    # Adjust learning rate during the warm-up phase
+    adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_start_lr)
+
+    train_loss = run_epoch(train_loader, is_training=True)
+    val_loss, val_dice = run_epoch(val_loader, is_training=False)
+    
+    writer.add_scalar('Loss/Train', train_loss, epoch)
+    writer.add_scalar('Loss/Val', val_loss, epoch)
+    writer.add_scalar('Dice/Val', val_dice, epoch)
+
+    # Only use the scheduler after warm-up
+    if epoch >= warmup_epochs:
+        scheduler_lr.step(val_loss)  # Update the learning rate based on the validation loss
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'best_model2.pth')
+        print(f'Saved Best Model at Epoch {epoch+1}')
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_val_loss': best_val_loss,
+            'optimizer': optimizer.state_dict(),
+        }, filename='best_model_checkpoint.pth.tar')
+
+    if val_dice > best_val_dice:
+        best_val_dice = val_dice
+        torch.save(model.state_dict(), 'best_model_dice.pth')
+
+    if val_dice > best_val_dice:
+        best_val_dice = val_dice
+    
+
+    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}, Val Dice: {val_dice}')
+
+    # Early stopping
+    # early_stopping(val_loss, model)
+    # if early_stopping.early_stop:
+    #     print("Early stopping triggered")
+    #     break
+
+
+writer.close()
+print('Finished Training')
+
+
+
+transforms2 = Compose([
+    LoadImaged(keys=["image"]),
+    EnsureChannelFirstd(keys=["image"]),
+    Orientationd(keys=["image"], axcodes="RAS"),
+    ScaleIntensityd(keys=["image"]),
+    CenterSpatialCropd(keys=["image"], roi_size=[128, 128, 128]),
+    EnsureTyped(keys=["image"]),
+])
+
+transforms_labels = Compose([
+    LoadImaged(keys=["label"]),  # Load the label with the key 'label'
+    EnsureChannelFirstd(keys=["label"]),
+    Orientationd(keys=["label"], axcodes="RAS"),
+    CenterSpatialCropd(keys=["label"], roi_size=[128, 128, 128]),
+    EnsureTyped(keys=["label"]),
+])
+
+
+test_image_path = '/datasets/tdt4265/mic/asoca/Diseased/CTCA/Diseased_1.nrrd'
+test_label_path = '/datasets/tdt4265/mic/asoca/Diseased/Annotations/Diseased_1.nrrd'
+
+# Prepare the image dictionary for the transform
+test_data2 = {'image': test_image_path}
+label_data = {'label': test_label_path}
+
+# Apply the transforms
+test_data2 = transforms2(test_data2)
+label_data = transforms_labels(label_data)  
+
+# model = SegMamba(in_chans=1, out_chans=4, depths=[2, 2, 2, 2], feat_size=[48, 96, 192, 384]).cuda()
+
+# Load the model weights
+# model.load_state_dict(torch.load('/work/olivesa/blackmamba/best_model2p1.pth'))
+
+# Model in evaluation mode
+model.eval()
+
+# Get the test tensor, ensuring it's on GPU
+test_tensor = test_data2['image'].unsqueeze(0).cuda()  # Add a batch dimension
+label_tensor = label_data['label'].unsqueeze(0).cuda()  # Add a batch dimension for consistency
+
+# Run inference
+output2 = model(test_tensor)
+
+# Convert the output to a numpy array and move it to CPU memory
+output_data2 = output2.cpu().detach().numpy()
+
+
+
+# Select one channel of the output for simplicity (modify this as needed)
+output_channel_data = output_data2[0, 0, :, :, :]  # Select the first channel
+
+np.set_printoptions(threshold=np.inf)
+
+#print(output_channel_data)
+# # Apply the threshold filter
+# threshold = 0.1
+# output_channel_data[output_channel_data < threshold] = 0
+
+nrrd.write('inference.nrrd', output_channel_data)
+print('okk')
+
+
+# Extract the label data as a numpy array and apply threshold
+label_array = label_tensor.cpu().numpy()
+label_channel_data = label_array[0, 0, :, :, :]  # Assuming l
+
+# Save the thresholded label data as an NRRD file
+nrrd.write('labels1.nrrd', label_channel_data)
