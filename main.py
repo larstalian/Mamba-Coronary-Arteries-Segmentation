@@ -13,6 +13,8 @@ from model_segmamba.segmamba import SegMamba
 from torch.cuda.amp import GradScaler, autocast
 from monai.data import SmartCacheDataset
 from blackmamba.early_stopping import EarlyStopping
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = True
@@ -95,22 +97,6 @@ def adjust_learning_rate(optimizer, epoch, warmup_epochs, base_lr, warmup_start_
 def sigmoid_activation(x):
     return torch.sigmoid(x)
 
-def dice_coefficient(pred, target, smooth=1.):
-    pred = sigmoid_activation(pred)  # Convert logits to probabilities
-    pred = (pred > 0.5).float()  # Threshold probabilities to get binary predictions
-    intersection = (pred * target).sum(dim=(2, 3, 4))
-    union = pred.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
-    dice = (2. * intersection + smooth) / (union + smooth)
-    return dice.mean()
-
-def dice_loss(pred, target, smooth=1.):
-    pred = sigmoid_activation(pred)  # Convert logits to probabilities
-    pred = (pred > 0.5).float()  # Threshold probabilities to get binary predictions
-    intersection = (pred * target).sum(dim=(2, 3, 4))
-    union = pred.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
-    dice = (2. * intersection + smooth) / (union + smooth)
-    return 1 - dice.mean()
-
 def save_checkpoint(state, filename="checkpoint.pth.tar"):
     torch.save(state, filename)
 
@@ -120,12 +106,16 @@ def load_checkpoint(filename="checkpoint.pth.tar"):
     optimizer.load_state_dict(state['optimizer'])
     return state['epoch'], state['best_val_loss']
 
-# Helper function to perform a training or validation epoch
+dice_loss = DiceLoss(to_onehot_y=True, sigmoid=True, squared_pred=True)
+dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
 
 def run_epoch(loader, is_training=True):
     epoch_loss = 0.0
     epoch_dice = 0.0
     scaler = GradScaler()  # Initialize the gradient scaler
+
+    # Reset the Dice metric at the start of each epoch
+    dice_metric.reset()
 
     if is_training:
         model.train()
@@ -143,37 +133,30 @@ def run_epoch(loader, is_training=True):
         # Using automatic mixed precision
         with autocast():
             outputs = model(inputs)
-            dice_loss_val = dice_loss(outputs, labels)  # Calculate Dice loss
+            loss = dice_loss(outputs, labels)  # Calculate Dice loss
             ce_loss = F.cross_entropy(outputs, labels.squeeze(1))  # Calculate cross-entropy loss
-            loss = dice_loss_val + ce_loss  # Combine losses
-
-        if not is_training:
-            with autocast():
-                dice = dice_coefficient(outputs, labels)  # Compute the Dice coefficient
-            epoch_dice += dice.item()
+            loss += ce_loss  # Combine losses
 
         if is_training:
             # Backward pass with automatic mixed precision
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
-            # Log gradient norms to TensorBoard
-            total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in model.parameters() if p.grad is not None]), 2)
-            writer.add_scalar('Gradient_norm', total_norm, epoch)
+        else:
+            # Update Dice metric for validation phase
+            dice_metric(outputs, labels)
 
         epoch_loss += loss.item()
 
-    # Calculate average loss and Dice for the epoch
+    # Calculate average loss and update Dice metric for the epoch
     num_batches = len(loader)
     avg_epoch_loss = epoch_loss / num_batches
     if not is_training:
-        avg_epoch_dice = epoch_dice / num_batches
+        avg_epoch_dice = dice_metric.aggregate().item()
+        dice_metric.reset()  # Reset the metric after each validation phase
         return avg_epoch_loss, avg_epoch_dice
     else:
         return avg_epoch_loss
-
-
 # Training and Validation Loop
 best_val_loss = float('inf')
 best_val_dice = 0.0
