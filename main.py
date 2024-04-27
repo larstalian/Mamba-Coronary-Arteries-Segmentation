@@ -15,28 +15,63 @@ from monai.transforms import (
     LoadImaged,
     ScaleIntensityd,
     SpatialCropd,
+    RandFlipd,
+    RandRotated,
+    RandShiftIntensityd,
+    EnsureTyped,
 )
 from monai.visualize import plot_2d_or_3d_image
-from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+import argparse
+import numpy as np
 
 from model_segmamba.segmamba import SegMamba
 
 
 def get_transforms():
-    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[100, 100, 100], roi_end=[164, 164, 164])
+    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[50, 50, 50], roi_end=[178, 178, 178])
     train_transforms = Compose([
         LoadImaged(keys=["img", "seg"]),
         EnsureChannelFirstd(keys=["img", "seg"]),
         spacial_crop,
+        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
+        RandRotated(
+            keys=["img", "seg"],
+            range_x=(0.0, 10.0),
+            range_y=(0.0, 10.0),
+            range_z=(0.0, 10.0),
+            prob=0.1,
+            keep_size=True,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+            dtype=np.float32
+        ),
+        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
         ScaleIntensityd(keys="img"),
+        EnsureTyped(keys=["img", "seg"]),
+
     ])
     val_transforms = Compose([
         LoadImaged(keys=["img", "seg"]),
         EnsureChannelFirstd(keys=["img", "seg"]),
-        spacial_crop,
+        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
+        RandRotated(
+            keys=["img", "seg"],
+            range_x=(0.0, 10.0),
+            range_y=(0.0, 10.0),
+            range_z=(0.0, 10.0),
+            prob=0.1,
+            keep_size=True,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+            dtype=np.float32
+        ),
+        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
         ScaleIntensityd(keys="img"),
+        EnsureTyped(keys=["img", "seg"]),
     ])
     return train_transforms, val_transforms
 
@@ -108,8 +143,13 @@ def main(root_dir, epochs, lr_step_size, version_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 2], feat_size=[48, 96, 192, 384]).to(device)
     loss_function = monai.losses.DiceLoss(sigmoid=True)
-    optimizer = torch.optim.Adam(model.parameters(), 1e-3)
-    scheduler = StepLR(optimizer, lr_step_size, gamma=0.5)
+
+    best_lr = 0.01065901858877665
+    best_lr_step_size = 70
+
+    optimizer = torch.optim.SGD(model.parameters(), best_lr, weight_decay=1e-5, momentum=0.99, nesterov=True)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, best_lr_step_size, 1e-6)
+
     dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
     post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
     writer = SummaryWriter()
@@ -185,15 +225,26 @@ def main(root_dir, epochs, lr_step_size, version_name):
     writer.close()
 
 
-if __name__ == "__main__":
-    root_dir = '/datasets/tdt4265/mic/asoca'
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run the coronary arteries segmentation model")
+    parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
+    parser.add_argument('--epochs', type=int, default=400, help='Number of epochs to train')
+    parser.add_argument('--idun', action='store_true', help='Use the Idun cluster path for datasets')
+    return parser.parse_args()
 
-    if '--tune' in sys.argv:
+
+if __name__ == "__main__":
+    args = parse_arguments()
+
+    root_dir = '/datasets/tdt4265/mic/asoca'
+    if args.idun:
+        root_dir = '/cluster/projects/vc/data/mic/open/Heart/ASOCA'
+
+    if args.tune:
         from hyperparam_tuning import run_study
 
         run_study(root_dir)
     else:
         iteration_version_name = 1.3
         lr_step_size = 50
-        epochs = 100
-        main(root_dir, epochs, lr_step_size, iteration_version_name)
+        main(root_dir, args.epochs, lr_step_size, iteration_version_name)
