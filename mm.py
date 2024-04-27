@@ -25,7 +25,7 @@ from model_segmamba.segmamba import SegMamba
 
 
 def get_transforms():
-    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[100, 100, 100], roi_end=[164, 164, 164])
+    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[100, 100, 90], roi_end=[164, 164, 154])
     train_transforms = Compose([
         LoadImaged(keys=["img", "seg"]),
         EnsureChannelFirstd(keys=["img", "seg"]),
@@ -52,10 +52,10 @@ def load_data(root_dir, train_transforms, val_transforms):
     return train_ds, val_ds
 
 
-def create_data_loaders(train_ds, val_ds, batch_size=1):
+def create_data_loaders(train_ds, val_ds):
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=True,
         num_workers=6,
         collate_fn=list_data_collate,
@@ -113,87 +113,30 @@ def main(root_dir, epochs, lr_step_size, version_name):
     dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
     post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
     writer = SummaryWriter()
-
-    val_interval = 2
     best_metric = -1
     best_metric_epoch = -1
-    epoch_loss_values = list()
-    metric_values = list()
-    writer = SummaryWriter()
     for epoch in range(epochs):
         print("-" * 10)
         print(f"epoch {epoch + 1}/{epochs}")
-        model.train()
-        epoch_loss = 0
-        step = 0
-        for batch_data in train_loader:
-            step += 1
-            inputs, labels = batch_data["img"].to(device), batch_data["seg"].to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            epoch_len = len(train_ds) // train_loader.batch_size
-            print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
-            writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
-        epoch_loss /= step
-        epoch_loss_values.append(epoch_loss)
+        epoch_len = len(train_ds) // train_loader.batch_size
+        epoch_loss = train_epoch(model, train_loader, device, optimizer, loss_function, writer, epoch, epoch_len)
         print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
-
-        # Update the learning rate
         scheduler.step()
-
-        if (epoch + 1) % val_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                val_images = None
-                val_labels = None
-                val_outputs = None
-                for val_data in val_loader:
-                    val_images, val_labels = val_data["img"].to(device), val_data["seg"].to(device)
-                    roi_size = (96, 96, 96)
-                    sw_batch_size = 4
-                    val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
-                    val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
-                    # compute metric for current iteration
-                    dice_metric(y_pred=val_outputs, y=val_labels)
-                # aggregate the final mean dice result
-                metric = dice_metric.aggregate().item()
-                # reset the status for next validation round
-                dice_metric.reset()
-
-                metric_values.append(metric)
-                if metric > best_metric:
-                    best_metric = metric
-                    best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), f"run_{version_name}_epochs_{epochs}_lr_step_{lr_step_size}.pth")
-                    print("saved new best metric model")
-                print(
-                    "current epoch: {} current mean dice: {:.4f} best mean dice: {:.4f} at epoch {}".format(
-                        epoch + 1, metric, best_metric, best_metric_epoch
-                    )
-                )
-                writer.add_scalar("val_mean_dice", metric, epoch + 1)
-                # plot the last model output as GIF image in TensorBoard with the corresponding image and label
-                plot_2d_or_3d_image(val_images, epoch + 1, writer, index=0, tag="image")
-                plot_2d_or_3d_image(val_labels, epoch + 1, writer, index=0, tag="label")
-                plot_2d_or_3d_image(val_outputs, epoch + 1, writer, index=0, tag="output")
-
-    print(f"train completed, best_metric: {best_metric:.4f} at epoch: {best_metric_epoch}")
+        if (epoch + 1) % 2 == 0:
+            metric = validate(model, val_loader, device, dice_metric, post_trans, writer, epoch + 1)
+            if metric > best_metric:
+                best_metric = metric
+                best_metric_epoch = epoch + 1
+                torch.save(model.state_dict(), f"run_{version_name}_epochs_{epochs}_lr_step_{lr_step_size}.pth")
+                print("saved new best metric model")
+            print(
+                f"current epoch: {epoch + 1} current mean dice: {metric:.4f} best mean dice: {best_metric:.4f} at epoch {best_metric_epoch}")
     writer.close()
 
 
 if __name__ == "__main__":
     root_dir = '/datasets/tdt4265/mic/asoca'
-
-    if '--tune' in sys.argv:
-        from hyperparam_tuning import run_study
-
-        run_study(root_dir)
-    else:
-        iteration_version_name = 1.3
-        lr_step_size = 50
-        epochs = 100
-        main(root_dir, epochs, lr_step_size, iteration_version_name)
+    iteration_version_name = 1.3
+    lr_step_size = 50
+    epochs = 100
+    main(root_dir, epochs, lr_step_size, iteration_version_name)

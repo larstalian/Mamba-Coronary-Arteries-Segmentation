@@ -1,18 +1,10 @@
 import logging
 import os
 import sys
-import tempfile
-from glob import glob
-import nibabel as nib
-import numpy as np
-from model_segmamba.segmamba import SegMamba
-import torch
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import StepLR
 
 import monai
-from monai.data import create_test_image_3d, list_data_collate, decollate_batch
+import torch
+from monai.data import list_data_collate, decollate_batch
 from monai.inferers import sliding_window_inference
 from monai.metrics import DiceMetric
 from monai.transforms import (
@@ -21,87 +13,146 @@ from monai.transforms import (
     AsDiscrete,
     Compose,
     LoadImaged,
-    RandCropByPosNegLabeld,
-    RandRotate90d,
     ScaleIntensityd,
     SpatialCropd,
+    RandFlipd,
+    RandRotated,
+    RandShiftIntensityd,
+    EnsureTyped,
 )
 from monai.visualize import plot_2d_or_3d_image
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import argparse
+import numpy as np
+
+from model_segmamba.segmamba import SegMamba
 
 
-def main(root_dir, epochs, lr_step_size, version_name):
-    run_name = f"run_{version_name}_epochs_{epochs}_lr_step_{lr_step_size}"
-    monai.config.print_config()
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+def get_transforms():
+    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[100, 100, 100], roi_end=[164, 164, 164])
+    train_transforms = Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        spacial_crop,
+        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
+        RandRotated(
+            keys=["img", "seg"],
+            range_x=(0.0, 10.0),
+            range_y=(0.0, 10.0),
+            range_z=(0.0, 10.0),
+            prob=0.1,
+            keep_size=True,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+            dtype=np.float32
+        ),
+        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
+        ScaleIntensityd(keys="img"),
+        EnsureTyped(keys=["img", "seg"]),
 
-    # Prepare dataset and dataloader
+    ])
+    val_transforms = Compose([
+        LoadImaged(keys=["img", "seg"]),
+        EnsureChannelFirstd(keys=["img", "seg"]),
+        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
+        RandRotated(
+            keys=["img", "seg"],
+            range_x=(0.0, 10.0),
+            range_y=(0.0, 10.0),
+            range_z=(0.0, 10.0),
+            prob=0.1,
+            keep_size=True,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+            dtype=np.float32
+        ),
+        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
+        ScaleIntensityd(keys="img"),
+        EnsureTyped(keys=["img", "seg"]),
+    ])
+    return train_transforms, val_transforms
+
+
+def load_data(root_dir, train_transforms, val_transforms):
     data_dicts = [{
         'img': os.path.join(root_dir, 'Diseased/CTCA', f'Diseased_{i}.nrrd'),
         'seg': os.path.join(root_dir, 'Diseased/Annotations', f'Diseased_{i}.nrrd')
     } for i in range(1, 20)]
-
-    # Partition dataset into training and validation sets
     train_files, val_files = monai.data.utils.partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
-
-    # For running on 40gig cant do higher than 256, 256, 128.
-    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[100, 100, 90], roi_end=[164, 164, 154])
-
-    train_transforms = Compose(
-        [
-            LoadImaged(keys=["img", "seg"]),
-            EnsureChannelFirstd(keys=["img", "seg"]),
-            spacial_crop,
-            ScaleIntensityd(keys="img"),
-            # RandCropByPosNegLabeld(
-            #     keys=["img", "seg"], label_key="seg", spatial_size=[96, 96, 96], pos=1, neg=1, num_samples=4
-            # ),
-            # RandRotate90d(keys=["img", "seg"], prob=0.5, spatial_axes=[0, 2]),
-        ]
-    )
-
-    # RandCropByPosNegLabeld - nice?
-
-    val_transforms = Compose(
-        [
-            LoadImaged(keys=["img", "seg"]),
-            EnsureChannelFirstd(keys=["img", "seg"]),
-            spacial_crop,
-            ScaleIntensityd(keys="img"),
-        ]
-    )
-
-    # define dataset, data loader
-    check_ds = monai.data.Dataset(data=train_files, transform=train_transforms)
-    # use batch_size=2 to load images and use RandCropByPosNegLabeld to generate 2 x 4 images for network training
-    check_loader = DataLoader(check_ds, batch_size=1, num_workers=6, collate_fn=list_data_collate)
-    check_data = monai.utils.misc.first(check_loader)
-    print(check_data["img"].shape, check_data["seg"].shape)
-
-    # create a training data loader
     train_ds = monai.data.Dataset(data=train_files, transform=train_transforms)
-    # use batch_size=2 to load images and use RandCropByPosNegLabeld to generate 2 x 4 images for network training
+    val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
+    return train_ds, val_ds
+
+
+def create_data_loaders(train_ds, val_ds, batch_size=1):
     train_loader = DataLoader(
         train_ds,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=6,
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
     )
-    # create a validation data loader
-    val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
     val_loader = DataLoader(val_ds, batch_size=1, num_workers=6, collate_fn=list_data_collate)
+    return train_loader, val_loader
+
+
+def train_epoch(model, train_loader, device, optimizer, loss_function, writer, epoch, epoch_len):
+    model.train()
+    epoch_loss = 0
+    for step, batch_data in enumerate(train_loader):
+        inputs, labels = batch_data["img"].to(device), batch_data["seg"].to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = loss_function(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+        writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
+    return epoch_loss / len(train_loader)
+
+
+def validate(model, val_loader, device, dice_metric, post_trans, writer, epoch):
+    model.eval()
+    with torch.no_grad():
+        for val_data in val_loader:
+            val_images, val_labels = val_data["img"].to(device), val_data["seg"].to(device)
+            roi_size = (96, 96, 96)
+            sw_batch_size = 4
+            val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
+            val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
+            dice_metric(y_pred=val_outputs, y=val_labels)
+        metric = dice_metric.aggregate().item()
+        dice_metric.reset()
+        writer.add_scalar("val_mean_dice", metric, epoch)
+        plot_2d_or_3d_image(val_images, epoch, writer, index=0, tag="image")
+        plot_2d_or_3d_image(val_labels, epoch, writer, index=0, tag="label")
+        plot_2d_or_3d_image(val_outputs, epoch, writer, index=0, tag="output")
+    return metric
+
+
+def main(root_dir, epochs, lr_step_size, version_name):
+    monai.config.print_config()
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    train_transforms, val_transforms = get_transforms()
+    train_ds, val_ds = load_data(root_dir, train_transforms, val_transforms)
+    train_loader, val_loader = create_data_loaders(train_ds, val_ds)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 2], feat_size=[48, 96, 192, 384]).to(device)
+    loss_function = monai.losses.DiceLoss(sigmoid=True)
+
+    best_lr = 0.01065901858877665
+    best_lr_step_size = 70
+
+    optimizer = torch.optim.SGD(model.parameters(), best_lr, weight_decay=1e-5, momentum=0.99, nesterov=True)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, best_lr_step_size, 1e-6)
+
     dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
     post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-    # create model, DiceLoss and Adam optimizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 2], feat_size=[48, 96, 192, 384]).cuda()
-
-    loss_function = monai.losses.DiceLoss(sigmoid=True)
-    optimizer = torch.optim.Adam(model.parameters(), 1e-3)
-
-    scheduler = StepLR(optimizer, lr_step_size, gamma=0.5)  # Decays the learning rate by half every x epochs
+    writer = SummaryWriter()
 
     val_interval = 2
     best_metric = -1
@@ -157,7 +208,7 @@ def main(root_dir, epochs, lr_step_size, version_name):
                 if metric > best_metric:
                     best_metric = metric
                     best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), f"{run_name}.pth")
+                    torch.save(model.state_dict(), f"run_{version_name}_epochs_{epochs}_lr_step_{lr_step_size}.pth")
                     print("saved new best metric model")
                 print(
                     "current epoch: {} current mean dice: {:.4f} best mean dice: {:.4f} at epoch {}".format(
@@ -174,10 +225,26 @@ def main(root_dir, epochs, lr_step_size, version_name):
     writer.close()
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run the coronary arteries segmentation model")
+    parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs to train')
+    parser.add_argument('--idun', action='store_true', help='Use the Idun cluster path for datasets')
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    # root_dir = "/cluster/projects/vc/data/mic/open/Heart/ASOCA/"
+    args = parse_arguments()
+
     root_dir = '/datasets/tdt4265/mic/asoca'
-    iteration_version_name = 1.3
-    lr_step_size = 50
-    epochs = 100
-    main(root_dir, epochs, lr_step_size, iteration_version_name)
+    if args.idun:
+        root_dir = '/cluster/projects/vc/data/mic/open/Heart/ASOCA'
+
+    if args.tune:
+        from hyperparam_tuning import run_study
+
+        run_study(root_dir)
+    else:
+        iteration_version_name = 1.3
+        lr_step_size = 50
+        main(root_dir, args.epochs, lr_step_size, iteration_version_name)
