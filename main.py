@@ -241,7 +241,7 @@ if __name__ == "__main__":
         root_dir = '/cluster/projects/vc/data/mic/open/Heart/ASOCA'
 
     if args.tune:
-        from hyperparam_tuning import run_study
+        from old.hyperparam_tuning import run_study
 
         run_study(root_dir)
     else:

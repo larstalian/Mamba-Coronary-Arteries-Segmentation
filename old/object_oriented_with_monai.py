@@ -19,7 +19,8 @@ from monai.transforms import (
     Orientationd,
     EnsureTyped,
     RandHistogramShiftd,
-    SpatialCropd
+    SpatialCropd,
+    RandShiftIntensityd
 )
 from monai.visualize import plot_2d_or_3d_image
 from monai.data import SmartCacheDataset
@@ -63,11 +64,11 @@ class Blackmamba:
         self.setup_model()
 
     def setup_model(self):
-        self.model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 1], feat_size=[48, 96, 132, 482]).cuda()
-        self.loss_function = CombinedLoss(weight_dice=0.65, weight_ce=0.35)
-        # self.optimizer = torch.optim.SGD(self.model.parameters(), self.lr, weight_decay=1e-5, momentum=0.99,
-        #                                  nesterov=True)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
+        self.model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 2], feat_size=[48, 96, 132, 224]).cuda()
+        self.loss_function = CombinedLoss(weight_dice=0.8, weight_ce=0.2)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), self.lr, weight_decay=1e-5, momentum=0.99,
+                                         nesterov=True)
+        # self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, patience=5,
                                                                     verbose=True)
         self.dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
@@ -78,14 +79,14 @@ class Blackmamba:
 
     @staticmethod
     def get_transforms():
-        crop_size = (128, 128, 64)
-        sp_crop = SpatialCropd(keys=["img", "seg"], roi_start=[128, 128, 64], roi_end=[256, 256, 128])
+        crop_size = (256, 256, 128)
+        # sp_crop = SpatialCropd(keys=["img", "seg"], roi_start=[128, 128, 64], roi_end=[256, 256, 128])
 
         train_transforms = Compose([
             LoadImaged(keys=["img", "seg"]),
             EnsureChannelFirstd(keys=["img", "seg"]),
             Orientationd(keys=["img", "seg"], axcodes="RAS"),
-            sp_crop,
+            # sp_crop,
             RandSpatialCropd(keys=["img", "seg"], roi_size=crop_size, random_size=False),
             # RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
             # RandRotated(keys=["img", "seg"],
@@ -95,15 +96,16 @@ class Blackmamba:
             #             prob=0.1,
             #             keep_size=True),
             ScaleIntensityd(keys="img"),
+            RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
             EnsureTyped(keys=["img", "seg"]),
-            # RandHistogramShiftd(keys=["img"], num_control_points=3, prob=0.1),
+            RandHistogramShiftd(keys=["img"], num_control_points=3, prob=0.1),
         ])
 
         val_transforms = Compose([
             LoadImaged(keys=["img", "seg"]),
             EnsureChannelFirstd(keys=["img", "seg"]),
             Orientationd(keys=["img", "seg"], axcodes="RAS"),
-            sp_crop,
+            # sp_crop,
             ScaleIntensityd(keys="img"),
             EnsureTyped(keys=["img", "seg"]),
         ])
@@ -271,7 +273,7 @@ class Blackmamba:
         parser.add_argument('--idun', action='store_true', help='Use the Idun cluster path for datasets')
         parser.add_argument('--lr', type=float, default=0.0002, help='Learning rate')
         parser.add_argument('--lr_step', type=int, default=100, help='Step size for learning rate scheduler')
-        parser.add_argument('--it', type=float, default=2.3, help='Version name for the iteration')
+        parser.add_argument('--it', type=float, default=2.5, help='Version name for the iteration')
         parser.add_argument('--batch', type=int, default=1, help='Batch size')
         return parser.parse_args()
 

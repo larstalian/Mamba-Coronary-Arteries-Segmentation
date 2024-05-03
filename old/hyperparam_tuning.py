@@ -4,7 +4,7 @@ from monai.metrics import DiceMetric
 from monai.transforms import Compose, Activations, AsDiscrete
 from model_segmamba.segmamba import SegMamba
 from monai.losses import DiceLoss
-from main import Blackmamba
+from object_oriented_with_monai import Blackmamba
 
 
 def objective(trial, directory):
