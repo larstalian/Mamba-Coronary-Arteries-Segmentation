@@ -1,250 +1,336 @@
-import logging
 import os
-import sys
-
-import monai
 import torch
-from monai.data import list_data_collate, decollate_batch
-from monai.inferers import sliding_window_inference
-from monai.metrics import DiceMetric
-from monai.transforms import (
-    Activations,
-    EnsureChannelFirstd,
-    AsDiscrete,
-    Compose,
-    LoadImaged,
-    ScaleIntensityd,
-    SpatialCropd,
-    RandFlipd,
-    RandRotated,
-    RandShiftIntensityd,
-    EnsureTyped,
-)
-from monai.visualize import plot_2d_or_3d_image
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import argparse
+from monai.metrics import HausdorffDistanceMetric
+import random
 import numpy as np
-
+import matplotlib.pyplot as plt
+import nrrd
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn import functional as F
+from monai.transforms import (
+    Compose, LoadImaged, ScaleIntensityd, EnsureTyped, EnsureChannelFirstd,
+    Orientationd, SpatialPadd, SpatialCropd
+)
+from monai.data import DataLoader, Dataset, partition_dataset, SmartCacheDataset
+from monai.config import print_config
 from model_segmamba.segmamba import SegMamba
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import ExponentialLR
+
+#initializze hd95
+hausdorff_distance = HausdorffDistanceMetric(percentile=95, include_background=False)
+hausdorff_distance_val = HausdorffDistanceMetric(percentile=95, include_background=False)
 
 
-def get_transforms():
-    spacial_crop = SpatialCropd(keys=["img", "seg"], roi_start=[50, 50, 50], roi_end=[178, 178, 178])
-    train_transforms = Compose([
-        LoadImaged(keys=["img", "seg"]),
-        EnsureChannelFirstd(keys=["img", "seg"]),
-        spacial_crop,
-        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
-        RandRotated(
-            keys=["img", "seg"],
-            range_x=(0.0, 10.0),
-            range_y=(0.0, 10.0),
-            range_z=(0.0, 10.0),
-            prob=0.1,
-            keep_size=True,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
-            dtype=np.float32
-        ),
-        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
-        ScaleIntensityd(keys="img"),
-        EnsureTyped(keys=["img", "seg"]),
+# Configuration
+root_dir = '/datasets/tdt4265/mic/asoca'
+num_epochs = 250
+batch_size = 1
+learning_rate = 0.001
 
-    ])
-    val_transforms = Compose([
-        LoadImaged(keys=["img", "seg"]),
-        EnsureChannelFirstd(keys=["img", "seg"]),
-        RandFlipd(keys=["img", "seg"], spatial_axis=[0, 1, 2]),
-        RandRotated(
-            keys=["img", "seg"],
-            range_x=(0.0, 10.0),
-            range_y=(0.0, 10.0),
-            range_z=(0.0, 10.0),
-            prob=0.1,
-            keep_size=True,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
-            dtype=np.float32
-        ),
-        RandShiftIntensityd(keys=["img"], offsets=0.1, prob=0.5),
-        ScaleIntensityd(keys="img"),
-        EnsureTyped(keys=["img", "seg"]),
-    ])
-    return train_transforms, val_transforms
+def dice_coefficient(preds, targets, smooth=1e-5):
+    preds = torch.sigmoid(preds)
+    preds = (preds > 0.5).float()  # Convert probabilities to binary values
+    intersection = (preds * targets).sum(dim=[2, 3, 4])  # Intersection
+    union = preds.sum(dim=[2, 3, 4]) + targets.sum(dim=[2, 3, 4])  # Union
+    dice = (2. * intersection + smooth) / (union + smooth)  # Dice coefficient
+    return dice.mean()  # Average over all batches
 
 
-def load_data(root_dir, train_transforms, val_transforms):
-    data_dicts = [{
-        'img': os.path.join(root_dir, 'Diseased/CTCA', f'Diseased_{i}.nrrd'),
-        'seg': os.path.join(root_dir, 'Diseased/Annotations', f'Diseased_{i}.nrrd')
-    } for i in range(1, 20)]
-    train_files, val_files = monai.data.utils.partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
-    train_ds = monai.data.Dataset(data=train_files, transform=train_transforms)
-    val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
-    return train_ds, val_ds
+
+# Transforms
+transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    ScaleIntensityd(keys=["image"]),
+    SpatialPadd(keys=["image", "label"], spatial_size=(512, 512, 224), mode='constant'),
+    #SpatialCropd(keys=["image", "label"], roi_center=(256, 256, 112), roi_size=(512, 512, 112)),
+    EnsureTyped(keys=["image", "label"]),
+])
+
+# Split data into smaller parts
 
 
-def create_data_loaders(train_ds, val_ds, batch_size=1):
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=6,
-        collate_fn=list_data_collate,
-        pin_memory=torch.cuda.is_available(),
-    )
-    val_loader = DataLoader(val_ds, batch_size=1, num_workers=6, collate_fn=list_data_collate)
-    return train_loader, val_loader
+def compute_probability_map(label_data, crop_size):
+    # Assuming label_data is a numpy array of the label
+    #print(label_data.shape)
+    label_data = label_data.squeeze()
+    z, y, x = label_data.shape
+    #print(label_data.shape)
+    
+    depth, height, width = crop_size
+    probability_map = np.zeros((z - depth + 1, y - height + 1, x - width + 1))
+
+    #power_factor = 2
+    scaling_factor = 0.1
+
+    for start_z in range(0, z - depth + 1, 50):
+        #print(start_z)
+        for start_y in range(0, y - height + 1, 50):
+            for start_x in range(0, x - width + 1, 14):
+                crop = label_data[start_z:start_z + depth, start_y:start_y + height, start_x:start_x + width]
+                probability_map[start_z, start_y, start_x] = np.exp(np.sum(crop) / scaling_factor)
+                #probability_map[start_z, start_y, start_x] = (np.sum(crop) ** power_factor)
+                probability_map[start_z, start_y, start_x] = np.sum(crop)
+
+    probability_map /= np.sum(probability_map)  # Normalize to create a probability distribution
+    return probability_map
+
+def weighted_random_crop(probability_map, crop_size):
+    z, y, x = probability_map.shape
+    depth, height, width = crop_size
+
+    # Flatten the probability map and sample a flat index
+    flat_index = np.random.choice(a=z * y * x, p=probability_map.ravel())
+    start_z = flat_index // (y * x)
+    start_y = (flat_index % (y * x)) // x
+    start_x = (flat_index % (y * x)) % x
+
+    return start_z, start_y, start_x
+
+def split_data(data, crop_size=(224, 224, 96)):
+    parts = []
+    num_subvolumes = 3
+    label_data = data['label'] 
+
+    probability_map = compute_probability_map(label_data, crop_size)
+
+    for _ in range(num_subvolumes):
+        start_x, start_y, start_z = weighted_random_crop(probability_map, crop_size)
+        #print('startsss', start_z, start_y, start_x)
 
 
-def train_epoch(model, train_loader, device, optimizer, loss_function, writer, epoch, epoch_len):
-    model.train()
-    epoch_loss = 0
-    for step, batch_data in enumerate(train_loader):
-        inputs, labels = batch_data["img"].to(device), batch_data["seg"].to(device)
+        crop_transform = SpatialCropd(
+            keys=["image", "label"],
+            roi_start=[start_x, start_y, start_z],
+            roi_end=[start_x + 224, start_y + 224, start_z + 96]
+        )
+
+        lists = crop_transform(data)['image']
+        #print(lists.shape)
+
+        parts.append(crop_transform(data))
+
+    return parts
+
+
+
+data_dicts_diseased_ctca = [{
+    'image': os.path.join(root_dir, 'Diseased/CTCA', f'Diseased_{i}.nrrd'),
+    'label': os.path.join(root_dir, 'Diseased/Annotations', f'Diseased_{i}.nrrd')
+} for i in range(1, 20)]
+data_dicts_diseased_normal = [{
+    'image': os.path.join(root_dir, 'Normal/CTCA', f'Normal_{i}.nrrd'),
+    'label': os.path.join(root_dir, 'Normal/Annotations', f'Normal_{i}.nrrd')
+} for i in range(1, 20)]
+
+data_dicts = data_dicts_diseased_ctca + data_dicts_diseased_normal
+
+train_files, val_files = partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
+
+model = SegMamba(in_chans=1, out_chans=1, depths=[2,2,2,2], feat_size=[48, 144, 192, 768], hidden_size=1024).cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = ExponentialLR(optimizer, gamma=0.92)  
+
+scaler = GradScaler()
+
+writer = SummaryWriter()
+
+
+class PartsDataset(torch.utils.data.Dataset):
+    def __init__(self, data_files, transforms):
+        self.data_files = data_files
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.data_files)
+
+    def __getitem__(self, idx):
+        data_dict = self.data_files[idx]
+        data = self.transforms(data_dict) 
+        parts = split_data(data)
+        return {"parts": parts}
+
+dataset = PartsDataset(train_files, transforms)
+train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+val_data = PartsDataset(val_files, transforms)
+val_loader = DataLoader(val_data, batch_size=1, shuffle=True)
+
+def focal_loss(inputs, targets, alpha=0.4, gamma=2.0):
+    """Compute binary focal loss between target and output logits."""
+    BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    targets = targets.float()
+    at = alpha * targets + (1 - alpha) * (1 - targets)
+    pt = torch.exp(-BCE_loss)
+    F_loss = at * (1-pt)**gamma * BCE_loss
+    return F_loss.mean()
+
+def combined_loss(outputs, labels, weight_dice=0.8, weight_focal=0.2):
+    dice_loss = 1 - dice_coefficient(outputs, labels)
+    focal_loss_value = focal_loss(outputs, labels)  
+    return weight_dice * dice_loss + weight_focal * focal_loss_value
+
+def run_epoch(loader, model, optimizer, is_training):
+    model.train() if is_training else model.eval()
+
+    total_epoch_loss = 0.0
+    total_epoch_dice = 0.0
+    total_parts_count = 0
+    #total_epoch_hd95 = 0
+
+
+    for batch_index, batch in enumerate(loader):      
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = loss_function(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
-        writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
-    return epoch_loss / len(train_loader)
+        total_batch_loss = 0.0
+        total_batch_dice = 0.0
+        part_count = 0
+        part_num = 0
+
+        parts = batch['parts']  
+    
+        for part in parts:
+            part_num += 1
+            #print(part_num)
+            #print(part)
+            images, labels = part['image'].cuda(), part['label'].cuda()
+
+            with autocast():
+                outputs = model(images)
+                loss = combined_loss(outputs, labels)
+                dice_score = dice_coefficient(outputs, labels)
+                hd95_score = hausdorff_distance(y_pred=outputs.int(), y=labels.int())
 
 
-def validate(model, val_loader, device, dice_metric, post_trans, writer, epoch):
-    model.eval()
-    with torch.no_grad():
-        for val_data in val_loader:
-            val_images, val_labels = val_data["img"].to(device), val_data["seg"].to(device)
-            roi_size = (96, 96, 96)
-            sw_batch_size = 4
-            val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
-            val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
-            dice_metric(y_pred=val_outputs, y=val_labels)
-        metric = dice_metric.aggregate().item()
-        dice_metric.reset()
-        writer.add_scalar("val_mean_dice", metric, epoch)
-        plot_2d_or_3d_image(val_images, epoch, writer, index=0, tag="image")
-        plot_2d_or_3d_image(val_labels, epoch, writer, index=0, tag="label")
-        plot_2d_or_3d_image(val_outputs, epoch, writer, index=0, tag="output")
-    return metric
+            scaler.scale(loss).backward()
+
+            # scaler.unscale_(optimizer)
+            # torch.nn.utils.clip_grad_norm(model.parameters(), max_norm=1.0)
+            # scaler.step(optimizer)
+            # scaler.update()
+
+            total_batch_loss += loss.item()
+            total_batch_dice += dice_score.item()
+            #total_epoch_hd95 += hausdorff_distance(preds, labels)
+
+            #print('raw_batch', dice_score.item()) to inspect the dice for each batch
+            part_count += 1
 
 
-def main(root_dir, epochs, lr_step_size, version_name):
-    monai.config.print_config()
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-    train_transforms, val_transforms = get_transforms()
-    train_ds, val_ds = load_data(root_dir, train_transforms, val_transforms)
-    train_loader, val_loader = create_data_loaders(train_ds, val_ds)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SegMamba(in_chans=1, out_chans=1, depths=[2, 2, 2, 2], feat_size=[48, 96, 192, 384]).to(device)
-    loss_function = monai.losses.DiceLoss(sigmoid=True)
+        if is_training:
+            # scaler.unscale_(optimizer)??? not sure if this was
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) #if nan is a problem then use this
+            scaler.step(optimizer)
+            scaler.update()
 
-    best_lr = 0.01065901858877665
-    best_lr_step_size = 70
+        optimizer.zero_grad()
 
-    optimizer = torch.optim.SGD(model.parameters(), best_lr, weight_decay=1e-5, momentum=0.99, nesterov=True)
-    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, best_lr_step_size, 1e-6)
-
-    dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
-    post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-    writer = SummaryWriter()
-
-    val_interval = 2
-    best_metric = -1
-    best_metric_epoch = -1
-    epoch_loss_values = list()
-    metric_values = list()
-    writer = SummaryWriter()
-    for epoch in range(epochs):
-        print("-" * 10)
-        print(f"epoch {epoch + 1}/{epochs}")
-        model.train()
-        epoch_loss = 0
-        step = 0
-        for batch_data in train_loader:
-            step += 1
-            inputs, labels = batch_data["img"].to(device), batch_data["seg"].to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_function(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            epoch_len = len(train_ds) // train_loader.batch_size
-            print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
-            writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
-        epoch_loss /= step
-        epoch_loss_values.append(epoch_loss)
-        print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
-
-        # Update the learning rate
-        scheduler.step()
-
-        if (epoch + 1) % val_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                val_images = None
-                val_labels = None
-                val_outputs = None
-                for val_data in val_loader:
-                    val_images, val_labels = val_data["img"].to(device), val_data["seg"].to(device)
-                    roi_size = (96, 96, 96)
-                    sw_batch_size = 4
-                    val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
-                    val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
-                    # compute metric for current iteration
-                    dice_metric(y_pred=val_outputs, y=val_labels)
-                # aggregate the final mean dice result
-                metric = dice_metric.aggregate().item()
-                # reset the status for next validation round
-                dice_metric.reset()
-
-                metric_values.append(metric)
-                if metric > best_metric:
-                    best_metric = metric
-                    best_metric_epoch = epoch + 1
-                    torch.save(model.state_dict(), f"run_{version_name}_epochs_{epochs}_lr_step_{lr_step_size}.pth")
-                    print("saved new best metric model")
-                print(
-                    "current epoch: {} current mean dice: {:.4f} best mean dice: {:.4f} at epoch {}".format(
-                        epoch + 1, metric, best_metric, best_metric_epoch
-                    )
-                )
-                writer.add_scalar("val_mean_dice", metric, epoch + 1)
-                # plot the last model output as GIF image in TensorBoard with the corresponding image and label
-                plot_2d_or_3d_image(val_images, epoch + 1, writer, index=0, tag="image")
-                plot_2d_or_3d_image(val_labels, epoch + 1, writer, index=0, tag="label")
-                plot_2d_or_3d_image(val_outputs, epoch + 1, writer, index=0, tag="output")
-
-    print(f"train completed, best_metric: {best_metric:.4f} at epoch: {best_metric_epoch}")
-    writer.close()
+        total_epoch_loss += total_batch_loss
+        total_epoch_dice += total_batch_dice
+        total_parts_count += part_count
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Run the coronary arteries segmentation model")
-    parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
-    parser.add_argument('--epochs', type=int, default=400, help='Number of epochs to train')
-    parser.add_argument('--idun', action='store_true', help='Use the Idun cluster path for datasets')
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    root_dir = '/datasets/tdt4265/mic/asoca'
-    if args.idun:
-        root_dir = '/cluster/projects/vc/data/mic/open/Heart/ASOCA'
-
-    if args.tune:
-        from old.hyperparam_tuning import run_study
-
-        run_study(root_dir)
+        if part_count > 0:
+            average_batch_loss = total_batch_loss / part_count
+            average_batch_dice = total_batch_dice / part_count
+            print(f"Batch {batch_index + 1}: Average Loss = {average_batch_loss:.4f}, Average Dice Coefficient = {average_batch_dice:.4f}")
+    if total_parts_count > 0:
+        average_epoch_loss = total_epoch_loss / total_parts_count
+        average_epoch_dice = total_epoch_dice / total_parts_count
+        #average_epoch_hd95 = total_epoch_hd95 / total_parts_count
     else:
-        iteration_version_name = 1.3
-        lr_step_size = 50
-        main(root_dir, args.epochs, lr_step_size, iteration_version_name)
+        average_epoch_loss = 0.0
+        average_epoch_dice = 0.0
+    hd95_score = hausdorff_distance.aggregate().item()
+    hausdorff_distance.reset()
+
+
+    return average_epoch_loss, average_epoch_dice, hd95_score
+
+def validate(loader, model):
+    model.eval() 
+    total_val_loss = 0.0
+    total_val_dice = 0.0
+    total_parts_count = 0
+
+    with torch.no_grad():
+        for batch_index, batch in enumerate(loader):
+            total_batch_loss = 0.0
+            total_batch_dice = 0.0
+            total_batch_hd95 = 0.0
+            part_count = 0
+
+            parts = batch['parts']  
+            for part in parts:
+                images, labels = part['image'].cuda(), part['label'].cuda()
+
+                # Forward pass
+                outputs = model(images)
+                loss = combined_loss(outputs, labels)
+                dice_score = dice_coefficient(outputs, labels)
+                hd95_score = hausdorff_distance_val(y_pred=outputs.int(), y=labels.int())
+
+                total_batch_loss += loss.item()
+                total_batch_dice += dice_score.item()
+                #total_batch_hd95 += hd95_score.item()
+                part_count += 1
+
+            total_val_loss += total_batch_loss
+            total_val_dice += total_batch_dice
+            #total_val_hd95 += total_batch_hd95
+            total_parts_count += part_count
+
+      
+    if total_parts_count > 0:
+        average_val_loss = total_val_loss / total_parts_count
+        average_val_dice = total_val_dice / total_parts_count
+    else:
+        average_val_loss = 0.0
+        average_val_dice = 0.0
+
+    #print(f'Validation: Average Loss = {average_val_loss:.4f}, Average Dice Coefficient = {average_val_dice:.4f}, Average HD95 = {average_val_hd95:.4f}')
+
+    hd95_score = hausdorff_distance_val.aggregate().item()
+    hausdorff_distance_val.reset()
+
+    return average_val_loss, average_val_dice, hd95_score
+
+
+
+epoch_dice_loss_list = []
+train_loss_list = []
+epoch_dice_val = []
+epoch_hd95 = []
+for epoch in range(num_epochs):
+    train_loss, train_dice, hd95 = run_epoch(train_loader, model, optimizer, is_training=True)
+    #print(train_loss)
+    print('/n/n/n')
+    #print(train_dice)
+    epoch_dice_loss_list.append(train_dice)
+    train_loss_list.append(train_loss)
+    if epoch%5==0:
+        val_loss, val_dice, val_hd95 = validate(val_loader, model)
+    print(f'val_loss: {val_loss}, val_dice: {val_dice}, val_hd95: {val_hd95}')
+
+    writer.add_scalar('Loss/Train', train_loss, epoch)
+    writer.add_scalar('DiceCoefficient/Train', train_dice, epoch)
+    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss}, Dice Coefficient: {train_dice}. HD95: {hd95}')
+    scheduler.step()
+    epoch_dice_val.append(val_dice)
+    epoch_hd95.append(val_hd95)
+
+
+    #os.makedirs("modelos", exist_ok=True)
+
+
+    if epoch == num_epochs-1:
+        torch.save(model.state_dict(), os.path.join("modelos", f'latest_model.pth'))
+    if val_dice == max(epoch_dice_val):
+        torch.save(model.state_dict(), os.path.join("modelos", f'best_epoch_{epoch+1}_model.pth'))
+
+
+writer.close()
+print('Finished Training')
+
+
