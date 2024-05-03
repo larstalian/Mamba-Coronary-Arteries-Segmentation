@@ -39,13 +39,13 @@ ImageCAS established a large-scale benchmark context for coronary artery segment
 
 \section{Experimental Setup}
 \subsection{Data and Split}
-We used ASOCA-style coronary CTA data with voxel-level labels across normal and diseased cohorts. All comparisons used the same fixed 80/20 train-validation split.
+We used ASOCA-style coronary CTA data with voxel-level labels across normal and diseased cohorts. All comparisons used the same fixed 80/20 train-validation split. For context, SegMamba reports 70/10/20 train-validation-test splits on its benchmark datasets \cite{xing2024segmamba}.
 
 \subsection{Metrics}
 Primary metric was mean validation Dice. HD95 was tracked as a secondary boundary-quality metric.
 
 \subsection{Compute Budget}
-The project was limited to a single A100 GPU. This directly constrained full-volume training feasibility, total hyperparameter sweep depth, and the number of long training runs that could be executed.
+The project was limited to a single A100 GPU. This directly constrained full-volume training feasibility, total hyperparameter sweep depth, and the number of long training runs that could be executed. In contrast, SegMamba reports training on four NVIDIA A100 GPUs for 1000 epochs with batch size 2 per GPU \cite{xing2024segmamba}.
 
 \section{Model Variants}
 U-Net baseline: convolutional encoder-decoder with skip connections.\\
@@ -60,7 +60,7 @@ Three implementation decisions were first-order:
     \item Stability controls (mixed precision, gradient clipping, deterministic split/seed, periodic validation, checkpointing).
 \end{itemize}
 
-These steps were necessary to make SegMamba training behavior stable enough for meaningful comparison.
+These steps were necessary to make SegMamba training behavior stable enough for meaningful comparison. Our training recipe also differs from SegMamba's reported defaults (cross-entropy loss, SGD optimizer, polynomial LR decay) \cite{xing2024segmamba}.
 
 \section{Results}
 \begin{table}[t]
@@ -89,7 +89,7 @@ U-Net was strongest in this regime. Mamba-based models were competitive but did 
 \end{figure*}
 
 \section{Discussion}
-The negative result versus U-Net should not be interpreted as evidence against SegMamba in general. In this setup, the most likely bottlenecks were optimization and scale rather than representational ceiling: higher sensitivity to hyperparameters, patch-policy effects on continuity learning, and limited sweep breadth under a single-GPU budget. The legacy evidence in Fig.~\ref{fig:legacy_evidence} is consistent with this interpretation: optimization remains stable, qualitative outputs are reasonable, but validation improvements flatten under constrained search budget. In short, our intent was to explore SegMamba early on this domain; we obtained a stable and comparable result, but not a new best score.
+The negative result versus U-Net should not be interpreted as evidence against SegMamba in general. In this setup, the most likely bottlenecks were optimization and scale rather than representational ceiling: higher sensitivity to hyperparameters, patch-policy effects on continuity learning, and limited sweep breadth under a single-GPU budget. Given differences in data protocol, optimizer/loss recipe, and compute scale relative to SegMamba's reported setting \cite{xing2024segmamba}, this result should be treated as a constrained task-specific replication rather than a direct leaderboard comparison. The legacy evidence in Fig.~\ref{fig:legacy_evidence} is consistent with this interpretation: optimization remains stable, qualitative outputs are reasonable, but validation improvements flatten under constrained search budget. In short, our intent was to explore SegMamba early on this domain; we obtained a stable and comparable result, but not a new best score.
 
 \section{Limitations and Next Steps}
 This is a validation-centric study and not a benchmark submission. We also did not run exhaustive task-specific hyperparameter searches for SegMamba due to the single-GPU compute budget. The primary run profile was: 1$\times$A100, patch size 224$\times$224$\times$96, batch size 1, 120 epochs, validation every 5 epochs, and mixed precision training. The most valuable next steps are overlap-aware patching, structured sweeps on patch/loss parameters, threshold calibration per volume, and experiments on larger datasets where long-range modeling may provide larger gains.

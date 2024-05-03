@@ -78,12 +78,12 @@ These are validation-set numbers from the earlier project phase:
 | Mamba-Encoder | 0.7734 |
 | SegMamba | 0.7673 |
 
-See the report in [`docs/report_2026.pdf`](docs/report_2026.pdf).
+See the report in [`docs/report.pdf`](docs/report.pdf).
 
 ## Reports
 
-- Updated short report PDF: [`docs/report_2026.pdf`](docs/report_2026.pdf)
-- LaTeX source: [`docs/report_2026.tex`](docs/report_2026.tex)
+- Report PDF: [`docs/report.pdf`](docs/report.pdf)
+- LaTeX source: [`docs/report.tex`](docs/report.tex)
 
 ## Notes
 
