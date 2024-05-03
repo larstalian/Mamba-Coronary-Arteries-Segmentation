@@ -17,12 +17,10 @@ from model_segmamba.segmamba import SegMamba
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ExponentialLR
 
-#initializze hd95
 hausdorff_distance = HausdorffDistanceMetric(percentile=95, include_background=False)
 hausdorff_distance_val = HausdorffDistanceMetric(percentile=95, include_background=False)
 
 
-# Configuration
 root_dir = '/datasets/tdt4265/mic/asoca'
 num_epochs = 250
 batch_size = 1
@@ -30,11 +28,11 @@ learning_rate = 0.001
 
 def dice_coefficient(preds, targets, smooth=1e-5):
     preds = torch.sigmoid(preds)
-    preds = (preds > 0.5).float()  # Convert probabilities to binary values
-    intersection = (preds * targets).sum(dim=[2, 3, 4])  # Intersection
-    union = preds.sum(dim=[2, 3, 4]) + targets.sum(dim=[2, 3, 4])  # Union
-    dice = (2. * intersection + smooth) / (union + smooth)  # Dice coefficient
-    return dice.mean()  # Average over all batches
+    preds = (preds > 0.5).float()  
+    intersection = (preds * targets).sum(dim=[2, 3, 4])  
+    union = preds.sum(dim=[2, 3, 4]) + targets.sum(dim=[2, 3, 4])  
+    dice = (2. * intersection + smooth) / (union + smooth) 
+    return dice.mean()  
 
 
 
@@ -53,7 +51,6 @@ transforms = Compose([
 
 
 def compute_probability_map(label_data, crop_size):
-    # Assuming label_data is a numpy array of the label
     #print(label_data.shape)
     label_data = label_data.squeeze()
     z, y, x = label_data.shape
@@ -74,7 +71,7 @@ def compute_probability_map(label_data, crop_size):
                 #probability_map[start_z, start_y, start_x] = (np.sum(crop) ** power_factor)
                 probability_map[start_z, start_y, start_x] = np.sum(crop)
 
-    probability_map /= np.sum(probability_map)  # Normalize to create a probability distribution
+    probability_map /= np.sum(probability_map)  
     return probability_map
 
 def weighted_random_crop(probability_map, crop_size):
