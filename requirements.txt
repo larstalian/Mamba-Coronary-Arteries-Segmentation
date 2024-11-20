@@ -1,0 +1,8 @@
+torch
+monai
+mamba-ssm
+numpy
+pynrrd
+tensorboard
+tqdm
+matplotlib

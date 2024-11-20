@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Training artifacts
+runs/
+logs/
+checkpoints/
+outputs/
+modelos/
+*.pt
+*.pth
+*.ckpt
+
+# Generated data artifacts
+inference_*.nrrd
+prediction*.nii.gz
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo

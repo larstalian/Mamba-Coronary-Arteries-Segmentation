@@ -1,0 +1,19 @@
+[project]
+name = "mamba-coronary-arteries-segmentation"
+version = "0.1.0"
+description = "SegMamba-based coronary artery segmentation project"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "monai",
+  "mamba-ssm",
+  "numpy",
+  "pynrrd",
+  "tensorboard",
+  "tqdm",
+  "matplotlib",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

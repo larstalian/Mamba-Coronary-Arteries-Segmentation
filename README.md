@@ -1,52 +1,91 @@
-# Coronary Arteries Segmentation
+# Coronary Artery Segmentation with SegMamba
 
-SegMamba-based implementation for coronary artery segmentation.
+Resume-ready project for 3D coronary artery segmentation on ASOCA CTCA volumes using the exact SegMamba architecture from the original paper and official codebase.
 
-## Dependencies
+## What This Repository Contains
 
-- PyTorch
-- MONAI
-- pynrrd
-- tensorboard
+- Reproducible training entrypoint with CLI config (`main.py`)
+- Sliding-window inference script (`inference.py`)
+- Lightweight volume visualization utility (`visualize.py`)
+- SegMamba model implementation (`model_segmamba/segmamba.py`)
+- Legacy experiment scripts kept for traceability (`legacy/`)
+- Updated short report assets (`docs/`)
 
-## Setup
+## Quick Start
 
-1. Clone [SegMamba](https://github.com/ge-xing/SegMamba) and install dependencies
-2. Clone this repository
-3. Update `root_dir` in `main.py` to your dataset path (expects ASOCA format)
+### 1) Install dependencies (uv)
 
-## Usage
-
-**Training:**
 ```bash
-python main.py
+uv sync
 ```
 
-**Inference:**
+Alternative:
+
 ```bash
-python inference.py
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-**Visualization:**
-```bash
-python visualize.py
+### 2) Expected dataset layout (ASOCA)
+
+```text
+<DATA_ROOT>/
+  Diseased/
+    CTCA/Diseased_1.nrrd ... Diseased_19.nrrd
+    Annotations/Diseased_1.nrrd ... Diseased_19.nrrd
+  Normal/
+    CTCA/Normal_1.nrrd ... Normal_19.nrrd
+    Annotations/Normal_1.nrrd ... Normal_19.nrrd
 ```
 
-## Training Configuration
+### 3) Train
 
-- Epochs: 250
-- Batch size: 1
-- Learning rate: 0.001
-- Patch size: 512×512×224
-- Metrics: Dice coefficient, Hausdorff distance (95th percentile)
+```bash
+uv run python main.py \
+  --data-root /path/to/asoca \
+  --output-dir outputs/segmamba_run \
+  --epochs 120 \
+  --patch-size 224,224,96 \
+  --samples-per-volume 3 \
+  --val-interval 5 \
+  --amp
+```
 
-## Structure
+### 4) Inference
 
-- `model_segmamba/` - SegMamba model implementation
-- `main.py` - Training script (ASOCA dataset, 512×512×224 patches)
-- `inference.py` - Inference script
-- `visualize.py` - Visualization utilities
+```bash
+uv run python inference.py \
+  --checkpoint outputs/segmamba_run/checkpoints/best_model.pt \
+  --image /path/to/Diseased_1.nrrd \
+  --output outputs/segmamba_run/inference_mask.nrrd \
+  --patch-size 224,224,96
+```
 
-## Additional Models
+### 5) Visualize slices
 
-For UNet and Mamba-Encoder variants, see [LightM-UNet](https://github.com/MrBlankness/LightM-UNet).
+```bash
+uv run python visualize.py --volume outputs/segmamba_run/inference_mask.nrrd
+```
+
+## Historical Results (from prior report)
+
+These are validation-set numbers from the earlier project phase:
+
+| Model | Mean Validation Dice |
+|---|---:|
+| UNet baseline | 0.7844 |
+| Mamba-Encoder | 0.7734 |
+| SegMamba | 0.7673 |
+
+See the report in [`docs/report_2026.pdf`](docs/report_2026.pdf).
+
+## Reports
+
+- Updated short report PDF: [`docs/report_2026.pdf`](docs/report_2026.pdf)
+- LaTeX source: [`docs/report_2026.tex`](docs/report_2026.tex)
+
+## Notes
+
+- `legacy/` contains older scripts retained for experiment traceability.
+- Checkpoints and generated artifacts are ignored via `.gitignore`.

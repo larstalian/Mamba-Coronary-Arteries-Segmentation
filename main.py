@@ -1,333 +1,467 @@
-import os
-import torch
-from monai.metrics import HausdorffDistanceMetric
+#!/usr/bin/env python3
+"""Train SegMamba on the ASOCA coronary artery dataset.
+
+This script is designed as the primary, reproducible training entrypoint for the
+repository. It supports deterministic split creation, targeted foreground patch
+sampling, mixed-precision training, checkpointing, and JSONL metric logging.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import random
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
-import nrrd
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn import functional as F
+import torch
+from monai.losses import DiceLoss
+from monai.metrics import HausdorffDistanceMetric
 from monai.transforms import (
-    Compose, LoadImaged, ScaleIntensityd, EnsureTyped, EnsureChannelFirstd,
-    Orientationd, SpatialPadd, SpatialCropd
+    Compose,
+    EnsureChannelFirstd,
+    EnsureTyped,
+    LoadImaged,
+    Orientationd,
+    ScaleIntensityd,
+    SpatialPadd,
 )
-from monai.data import DataLoader, Dataset, partition_dataset, SmartCacheDataset
-from monai.config import print_config
-from model_segmamba.segmamba import SegMamba
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import ExponentialLR
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
-hausdorff_distance = HausdorffDistanceMetric(percentile=95, include_background=False)
-hausdorff_distance_val = HausdorffDistanceMetric(percentile=95, include_background=False)
-
-
-root_dir = '/datasets/tdt4265/mic/asoca'
-num_epochs = 250
-batch_size = 1
-learning_rate = 0.001
-
-def dice_coefficient(preds, targets, smooth=1e-5):
-    preds = torch.sigmoid(preds)
-    preds = (preds > 0.5).float()  
-    intersection = (preds * targets).sum(dim=[2, 3, 4])  
-    union = preds.sum(dim=[2, 3, 4]) + targets.sum(dim=[2, 3, 4])  
-    dice = (2. * intersection + smooth) / (union + smooth) 
-    return dice.mean()  
+from model_segmamba.segmamba import SegMamba
 
 
-
-# Transforms
-transforms = Compose([
-    LoadImaged(keys=["image", "label"]),
-    EnsureChannelFirstd(keys=["image", "label"]),
-    Orientationd(keys=["image", "label"], axcodes="RAS"),
-    ScaleIntensityd(keys=["image"]),
-    SpatialPadd(keys=["image", "label"], spatial_size=(512, 512, 224), mode='constant'),
-    #SpatialCropd(keys=["image", "label"], roi_center=(256, 256, 112), roi_size=(512, 512, 112)),
-    EnsureTyped(keys=["image", "label"]),
-])
-
-# Split data into smaller parts
-
-
-def compute_probability_map(label_data, crop_size):
-    #print(label_data.shape)
-    label_data = label_data.squeeze()
-    z, y, x = label_data.shape
-    #print(label_data.shape)
-    
-    depth, height, width = crop_size
-    probability_map = np.zeros((z - depth + 1, y - height + 1, x - width + 1))
-
-    #power_factor = 2
-    scaling_factor = 0.1
-
-    for start_z in range(0, z - depth + 1, 50):
-        #print(start_z)
-        for start_y in range(0, y - height + 1, 50):
-            for start_x in range(0, x - width + 1, 14):
-                crop = label_data[start_z:start_z + depth, start_y:start_y + height, start_x:start_x + width]
-                probability_map[start_z, start_y, start_x] = np.exp(np.sum(crop) / scaling_factor)
-                #probability_map[start_z, start_y, start_x] = (np.sum(crop) ** power_factor)
-                probability_map[start_z, start_y, start_x] = np.sum(crop)
-
-    probability_map /= np.sum(probability_map)  
-    return probability_map
-
-def weighted_random_crop(probability_map, crop_size):
-    z, y, x = probability_map.shape
-    depth, height, width = crop_size
-
-    # Flatten the probability map and sample a flat index
-    flat_index = np.random.choice(a=z * y * x, p=probability_map.ravel())
-    start_z = flat_index // (y * x)
-    start_y = (flat_index % (y * x)) // x
-    start_x = (flat_index % (y * x)) % x
-
-    return start_z, start_y, start_x
-
-def split_data(data, crop_size=(224, 224, 96)):
-    parts = []
-    num_subvolumes = 3
-    label_data = data['label'] 
-
-    probability_map = compute_probability_map(label_data, crop_size)
-
-    for _ in range(num_subvolumes):
-        start_x, start_y, start_z = weighted_random_crop(probability_map, crop_size)
-        #print('startsss', start_z, start_y, start_x)
-
-
-        crop_transform = SpatialCropd(
-            keys=["image", "label"],
-            roi_start=[start_x, start_y, start_z],
-            roi_end=[start_x + 224, start_y + 224, start_z + 96]
+def parse_int_tuple(value: str, expected_len: int = 3) -> Tuple[int, ...]:
+    parts = tuple(int(x.strip()) for x in value.split(","))
+    if len(parts) != expected_len:
+        raise argparse.ArgumentTypeError(
+            f"Expected {expected_len} comma-separated ints, got: {value}"
         )
-
-        lists = crop_transform(data)['image']
-        #print(lists.shape)
-
-        parts.append(crop_transform(data))
-
     return parts
 
 
-
-data_dicts_diseased_ctca = [{
-    'image': os.path.join(root_dir, 'Diseased/CTCA', f'Diseased_{i}.nrrd'),
-    'label': os.path.join(root_dir, 'Diseased/Annotations', f'Diseased_{i}.nrrd')
-} for i in range(1, 20)]
-data_dicts_diseased_normal = [{
-    'image': os.path.join(root_dir, 'Normal/CTCA', f'Normal_{i}.nrrd'),
-    'label': os.path.join(root_dir, 'Normal/Annotations', f'Normal_{i}.nrrd')
-} for i in range(1, 20)]
-
-data_dicts = data_dicts_diseased_ctca + data_dicts_diseased_normal
-
-train_files, val_files = partition_dataset(data_dicts, ratios=[0.8, 0.2], shuffle=True)
-
-model = SegMamba(in_chans=1, out_chans=1, depths=[2,2,2,2], feat_size=[48, 144, 192, 768], hidden_size=1024).cuda()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ExponentialLR(optimizer, gamma=0.92)  
-
-scaler = GradScaler()
-
-writer = SummaryWriter()
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-class PartsDataset(torch.utils.data.Dataset):
-    def __init__(self, data_files, transforms):
-        self.data_files = data_files
-        self.transforms = transforms
+def build_case_list(data_root: Path) -> List[Dict[str, str]]:
+    cases: List[Dict[str, str]] = []
+    groups = [
+        ("Diseased", "Diseased"),
+        ("Normal", "Normal"),
+    ]
 
-    def __len__(self):
-        return len(self.data_files)
+    for group_dir, prefix in groups:
+        for idx in range(1, 20):
+            image = data_root / group_dir / "CTCA" / f"{prefix}_{idx}.nrrd"
+            label = data_root / group_dir / "Annotations" / f"{prefix}_{idx}.nrrd"
+            if image.exists() and label.exists():
+                cases.append({"image": str(image), "label": str(label)})
 
-    def __getitem__(self, idx):
-        data_dict = self.data_files[idx]
-        data = self.transforms(data_dict) 
-        parts = split_data(data)
-        return {"parts": parts}
+    if not cases:
+        raise FileNotFoundError(
+            f"No ASOCA cases found under {data_root}. Check dataset path/layout."
+        )
 
-dataset = PartsDataset(train_files, transforms)
-train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-val_data = PartsDataset(val_files, transforms)
-val_loader = DataLoader(val_data, batch_size=1, shuffle=True)
-
-def focal_loss(inputs, targets, alpha=0.4, gamma=2.0):
-    """Compute binary focal loss between target and output logits."""
-    BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-    targets = targets.float()
-    at = alpha * targets + (1 - alpha) * (1 - targets)
-    pt = torch.exp(-BCE_loss)
-    F_loss = at * (1-pt)**gamma * BCE_loss
-    return F_loss.mean()
-
-def combined_loss(outputs, labels, weight_dice=0.8, weight_focal=0.2):
-    dice_loss = 1 - dice_coefficient(outputs, labels)
-    focal_loss_value = focal_loss(outputs, labels)  
-    return weight_dice * dice_loss + weight_focal * focal_loss_value
-
-def run_epoch(loader, model, optimizer, is_training):
-    model.train() if is_training else model.eval()
-
-    total_epoch_loss = 0.0
-    total_epoch_dice = 0.0
-    total_parts_count = 0
-    #total_epoch_hd95 = 0
+    return cases
 
 
-    for batch_index, batch in enumerate(loader):      
-        optimizer.zero_grad()
-        total_batch_loss = 0.0
-        total_batch_dice = 0.0
-        part_count = 0
-        part_num = 0
+def split_cases(
+    cases: Sequence[Dict[str, str]], val_ratio: float, seed: int
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    if not 0 < val_ratio < 1:
+        raise ValueError("val_ratio must be in (0, 1)")
 
-        parts = batch['parts']  
-    
-        for part in parts:
-            part_num += 1
-            #print(part_num)
-            #print(part)
-            images, labels = part['image'].cuda(), part['label'].cuda()
+    shuffled = list(cases)
+    rng = random.Random(seed)
+    rng.shuffle(shuffled)
 
-            with autocast():
-                outputs = model(images)
-                loss = combined_loss(outputs, labels)
-                dice_score = dice_coefficient(outputs, labels)
-                hd95_score = hausdorff_distance(y_pred=outputs.int(), y=labels.int())
+    val_count = max(1, int(round(len(shuffled) * val_ratio)))
+    val_cases = shuffled[:val_count]
+    train_cases = shuffled[val_count:]
 
+    if not train_cases:
+        raise ValueError("Validation split too large; no training cases left")
+
+    return train_cases, val_cases
+
+
+class ASOCAPatchDataset(Dataset):
+    def __init__(
+        self,
+        cases: Sequence[Dict[str, str]],
+        patch_size: Tuple[int, int, int],
+        samples_per_volume: int,
+        foreground_sampling_prob: float,
+    ) -> None:
+        self.cases = list(cases)
+        self.patch_size = patch_size
+        self.samples_per_volume = samples_per_volume
+        self.foreground_sampling_prob = foreground_sampling_prob
+        self.transforms = Compose(
+            [
+                LoadImaged(keys=["image", "label"]),
+                EnsureChannelFirstd(keys=["image", "label"]),
+                Orientationd(keys=["image", "label"], axcodes="RAS"),
+                ScaleIntensityd(keys=["image"]),
+                SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
+                EnsureTyped(keys=["image", "label"]),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return len(self.cases) * self.samples_per_volume
+
+    def _choose_patch_start(
+        self, label: torch.Tensor
+    ) -> Tuple[int, int, int]:
+        spatial_shape = label.shape[-3:]
+        patch = self.patch_size
+
+        starts: List[int] = [0, 0, 0]
+
+        use_foreground = random.random() < self.foreground_sampling_prob
+        fg = torch.nonzero(label[0] > 0, as_tuple=False)
+
+        center: Sequence[int]
+        if use_foreground and len(fg) > 0:
+            center = fg[random.randrange(len(fg))].tolist()
+        else:
+            center = [random.randrange(d) for d in spatial_shape]
+
+        for axis in range(3):
+            dim = int(spatial_shape[axis])
+            size = int(patch[axis])
+            if dim <= size:
+                starts[axis] = 0
+                continue
+
+            min_start = 0
+            max_start = dim - size
+            proposed = int(center[axis] - size // 2)
+            starts[axis] = max(min_start, min(proposed, max_start))
+
+        return tuple(starts)
+
+    @staticmethod
+    def _crop(
+        tensor: torch.Tensor, start: Tuple[int, int, int], size: Tuple[int, int, int]
+    ) -> torch.Tensor:
+        slices = [slice(None)]
+        for axis in range(3):
+            s = start[axis]
+            e = s + size[axis]
+            slices.append(slice(s, e))
+        return tensor[tuple(slices)]
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        case = self.cases[idx % len(self.cases)]
+        sample = self.transforms(case)
+        image = sample["image"].float()
+        label = sample["label"].float()
+
+        start = self._choose_patch_start(label)
+        image_patch = self._crop(image, start, self.patch_size)
+        label_patch = self._crop(label, start, self.patch_size)
+
+        # Ensure binary target map for loss/metrics.
+        label_patch = (label_patch > 0).float()
+
+        return {"image": image_patch, "label": label_patch}
+
+
+def dice_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    preds = (torch.sigmoid(logits) > 0.5).float()
+    inter = (preds * targets).sum(dim=(1, 2, 3, 4))
+    union = preds.sum(dim=(1, 2, 3, 4)) + targets.sum(dim=(1, 2, 3, 4))
+    return ((2.0 * inter + 1e-5) / (union + 1e-5)).mean()
+
+
+def combined_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    dice_loss_fn: DiceLoss,
+    dice_weight: float,
+    bce_weight: float,
+) -> torch.Tensor:
+    dice_loss = dice_loss_fn(logits, targets)
+    bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
+    return dice_weight * dice_loss + bce_weight * bce_loss
+
+
+def evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    dice_loss_fn: DiceLoss,
+    amp_enabled: bool,
+    dice_weight: float,
+    bce_weight: float,
+) -> Dict[str, float]:
+    model.eval()
+
+    total_loss = 0.0
+    total_dice = 0.0
+    steps = 0
+
+    hd95_metric = HausdorffDistanceMetric(percentile=95, include_background=False)
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+
+            with autocast(enabled=amp_enabled):
+                logits = model(images)
+                loss = combined_loss(
+                    logits,
+                    labels,
+                    dice_loss_fn=dice_loss_fn,
+                    dice_weight=dice_weight,
+                    bce_weight=bce_weight,
+                )
+
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            hd95_metric(y_pred=preds, y=labels)
+
+            total_loss += float(loss.item())
+            total_dice += float(dice_from_logits(logits, labels).item())
+            steps += 1
+
+    mean_loss = total_loss / max(steps, 1)
+    mean_dice = total_dice / max(steps, 1)
+
+    hd95_value = hd95_metric.aggregate().item()
+    hd95_metric.reset()
+
+    return {
+        "loss": mean_loss,
+        "dice": mean_dice,
+        "hd95": float(hd95_value),
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    epoch: int,
+    best_val_dice: float,
+    patch_size: Tuple[int, int, int],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "best_val_dice": best_val_dice,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "model_kwargs": {
+                "in_chans": 1,
+                "out_chans": 1,
+                "depths": [2, 2, 2, 2],
+                "feat_size": [48, 96, 192, 384],
+                "hidden_size": 768,
+            },
+            "patch_size": list(patch_size),
+        },
+        path,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train SegMamba on ASOCA")
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/segmamba"))
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--val-interval", type=int, default=5)
+    parser.add_argument("--samples-per-volume", type=int, default=3)
+    parser.add_argument("--foreground-sampling-prob", type=float, default=0.8)
+    parser.add_argument("--patch-size", type=parse_int_tuple, default=(224, 224, 96))
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--dice-weight", type=float, default=0.8)
+    parser.add_argument("--bce-weight", type=float, default=0.2)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    device = torch.device(
+        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    amp_enabled = args.amp and device.type == "cuda"
+
+    output_dir = args.output_dir
+    checkpoints_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    all_cases = build_case_list(args.data_root)
+    train_cases, val_cases = split_cases(all_cases, args.val_ratio, args.seed)
+
+    train_ds = ASOCAPatchDataset(
+        train_cases,
+        patch_size=args.patch_size,
+        samples_per_volume=args.samples_per_volume,
+        foreground_sampling_prob=args.foreground_sampling_prob,
+    )
+    val_ds = ASOCAPatchDataset(
+        val_cases,
+        patch_size=args.patch_size,
+        samples_per_volume=max(1, args.samples_per_volume // 2),
+        foreground_sampling_prob=1.0,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    model = SegMamba(
+        in_chans=1,
+        out_chans=1,
+        depths=[2, 2, 2, 2],
+        feat_size=[48, 96, 192, 384],
+        hidden_size=768,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.92)
+    scaler = GradScaler(enabled=amp_enabled)
+    dice_loss_fn = DiceLoss(sigmoid=True)
+
+    print(f"Using device: {device}")
+    print(f"Cases: total={len(all_cases)} train={len(train_cases)} val={len(val_cases)}")
+    print(f"Patch size: {args.patch_size} | Samples/volume: {args.samples_per_volume}")
+
+    metrics_file = output_dir / "metrics.jsonl"
+    best_val_dice = -1.0
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        epoch_dice = 0.0
+        steps = 0
+
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        for batch in progress:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=amp_enabled):
+                logits = model(images)
+                loss = combined_loss(
+                    logits,
+                    labels,
+                    dice_loss_fn=dice_loss_fn,
+                    dice_weight=args.dice_weight,
+                    bce_weight=args.bce_weight,
+                )
 
             scaler.scale(loss).backward()
-
-            # scaler.unscale_(optimizer)
-            # torch.nn.utils.clip_grad_norm(model.parameters(), max_norm=1.0)
-            # scaler.step(optimizer)
-            # scaler.update()
-
-            total_batch_loss += loss.item()
-            total_batch_dice += dice_score.item()
-            #total_epoch_hd95 += hausdorff_distance(preds, labels)
-
-            #print('raw_batch', dice_score.item()) to inspect the dice for each batch
-            part_count += 1
-
-
-        if is_training:
-            # scaler.unscale_(optimizer)??? not sure if this was
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) #if nan is a problem then use this
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-        optimizer.zero_grad()
+            batch_dice = dice_from_logits(logits.detach(), labels)
+            epoch_loss += float(loss.item())
+            epoch_dice += float(batch_dice.item())
+            steps += 1
 
-        total_epoch_loss += total_batch_loss
-        total_epoch_dice += total_batch_dice
-        total_parts_count += part_count
+            progress.set_postfix(loss=f"{loss.item():.4f}", dice=f"{batch_dice.item():.4f}")
 
+        scheduler.step()
 
-        if part_count > 0:
-            average_batch_loss = total_batch_loss / part_count
-            average_batch_dice = total_batch_dice / part_count
-            print(f"Batch {batch_index + 1}: Average Loss = {average_batch_loss:.4f}, Average Dice Coefficient = {average_batch_dice:.4f}")
-    if total_parts_count > 0:
-        average_epoch_loss = total_epoch_loss / total_parts_count
-        average_epoch_dice = total_epoch_dice / total_parts_count
-        #average_epoch_hd95 = total_epoch_hd95 / total_parts_count
-    else:
-        average_epoch_loss = 0.0
-        average_epoch_dice = 0.0
-    hd95_score = hausdorff_distance.aggregate().item()
-    hausdorff_distance.reset()
+        train_loss = epoch_loss / max(steps, 1)
+        train_dice = epoch_dice / max(steps, 1)
 
+        record: Dict[str, float | int | None] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_dice": train_dice,
+            "val_loss": None,
+            "val_dice": None,
+            "val_hd95": None,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
 
-    return average_epoch_loss, average_epoch_dice, hd95_score
+        should_validate = epoch == 1 or (epoch % args.val_interval == 0)
+        if should_validate:
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                device=device,
+                dice_loss_fn=dice_loss_fn,
+                amp_enabled=amp_enabled,
+                dice_weight=args.dice_weight,
+                bce_weight=args.bce_weight,
+            )
+            record["val_loss"] = val_metrics["loss"]
+            record["val_dice"] = val_metrics["dice"]
+            record["val_hd95"] = val_metrics["hd95"]
 
-def validate(loader, model):
-    model.eval() 
-    total_val_loss = 0.0
-    total_val_dice = 0.0
-    total_parts_count = 0
+            if val_metrics["dice"] > best_val_dice:
+                best_val_dice = val_metrics["dice"]
+                save_checkpoint(
+                    checkpoints_dir / "best_model.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    best_val_dice=best_val_dice,
+                    patch_size=args.patch_size,
+                )
 
-    with torch.no_grad():
-        for batch_index, batch in enumerate(loader):
-            total_batch_loss = 0.0
-            total_batch_dice = 0.0
-            total_batch_hd95 = 0.0
-            part_count = 0
+        save_checkpoint(
+            checkpoints_dir / "latest_model.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            best_val_dice=best_val_dice,
+            patch_size=args.patch_size,
+        )
 
-            parts = batch['parts']  
-            for part in parts:
-                images, labels = part['image'].cuda(), part['label'].cuda()
+        with metrics_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
-                # Forward pass
-                outputs = model(images)
-                loss = combined_loss(outputs, labels)
-                dice_score = dice_coefficient(outputs, labels)
-                hd95_score = hausdorff_distance_val(y_pred=outputs.int(), y=labels.int())
+        print(json.dumps(record))
 
-                total_batch_loss += loss.item()
-                total_batch_dice += dice_score.item()
-                #total_batch_hd95 += hd95_score.item()
-                part_count += 1
-
-            total_val_loss += total_batch_loss
-            total_val_dice += total_batch_dice
-            #total_val_hd95 += total_batch_hd95
-            total_parts_count += part_count
-
-      
-    if total_parts_count > 0:
-        average_val_loss = total_val_loss / total_parts_count
-        average_val_dice = total_val_dice / total_parts_count
-    else:
-        average_val_loss = 0.0
-        average_val_dice = 0.0
-
-    #print(f'Validation: Average Loss = {average_val_loss:.4f}, Average Dice Coefficient = {average_val_dice:.4f}, Average HD95 = {average_val_hd95:.4f}')
-
-    hd95_score = hausdorff_distance_val.aggregate().item()
-    hausdorff_distance_val.reset()
-
-    return average_val_loss, average_val_dice, hd95_score
+    print(f"Training finished. Checkpoints saved in: {checkpoints_dir}")
 
 
-
-epoch_dice_loss_list = []
-train_loss_list = []
-epoch_dice_val = []
-epoch_hd95 = []
-for epoch in range(num_epochs):
-    train_loss, train_dice, hd95 = run_epoch(train_loader, model, optimizer, is_training=True)
-    #print(train_loss)
-    print('/n/n/n')
-    #print(train_dice)
-    epoch_dice_loss_list.append(train_dice)
-    train_loss_list.append(train_loss)
-    if epoch%5==0:
-        val_loss, val_dice, val_hd95 = validate(val_loader, model)
-    print(f'val_loss: {val_loss}, val_dice: {val_dice}, val_hd95: {val_hd95}')
-
-    writer.add_scalar('Loss/Train', train_loss, epoch)
-    writer.add_scalar('DiceCoefficient/Train', train_dice, epoch)
-    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss}, Dice Coefficient: {train_dice}. HD95: {hd95}')
-    scheduler.step()
-    epoch_dice_val.append(val_dice)
-    epoch_hd95.append(val_hd95)
-
-
-    #os.makedirs("modelos", exist_ok=True)
-
-
-    if epoch == num_epochs-1:
-        torch.save(model.state_dict(), os.path.join("modelos", f'latest_model.pth'))
-    if val_dice == max(epoch_dice_val):
-        torch.save(model.state_dict(), os.path.join("modelos", f'best_epoch_{epoch+1}_model.pth'))
-
-
-writer.close()
-print('Finished Training')
-
-
+if __name__ == "__main__":
+    main()
