@@ -1,33 +1,52 @@
-# Coronary Arteries Segmentation with SegMamba
+# Coronary Arteries Segmentation
 
-This repository hosts the implementation for Coronary Arteries Segmentation, employing the innovative SegMamba
-framework.
+SegMamba-based implementation for coronary artery segmentation.
 
-## About SegMamba
+## Dependencies
 
-SegMamba offers a cutting-edge approach to coronary arteries segmentation, providing robust and accurate results. By
-leveraging advanced techniques, SegMamba optimizes the segmentation process, ensuring high-quality outputs.
+- PyTorch
+- MONAI
+- pynrrd
+- tensorboard
 
-## Getting Started
+## Setup
 
-Follow these steps to set up the SegMamba environment and begin your experiments:
+1. Clone [SegMamba](https://github.com/ge-xing/SegMamba) and install dependencies
+2. Clone this repository
+3. Update `root_dir` in `main.py` to your dataset path (expects ASOCA format)
 
-1. **Clone SegMamba Repository:** Start by cloning the SegMamba repository
-   from [here](https://github.com/ge-xing/SegMamba?tab=readme-ov-file). Follow the installation instructions provided in
-   the repository to set up the environment.
+## Usage
 
-2. **Clone this Project:** Clone the Coronary Arteries Segmentation project repository.
+**Training:**
+```bash
+python main.py
+```
 
-3. **Activate Environment:** Ensure your environment is activated and all dependencies are installed as per the
-   instructions in the SegMamba repository.
+**Inference:**
+```bash
+python inference.py
+```
 
-4. **Run Experiments:** Utilize the `main.py` script to execute your experiments seamlessly within the SegMamba
-   framework.
+**Visualization:**
+```bash
+python visualize.py
+```
+
+## Training Configuration
+
+- Epochs: 250
+- Batch size: 1
+- Learning rate: 0.001
+- Patch size: 512×512×224
+- Metrics: Dice coefficient, Hausdorff distance (95th percentile)
+
+## Structure
+
+- `model_segmamba/` - SegMamba model implementation
+- `main.py` - Training script (ASOCA dataset, 512×512×224 patches)
+- `inference.py` - Inference script
+- `visualize.py` - Visualization utilities
 
 ## Additional Models
 
-For Unet and Mamba-Encoder models, clone the LightM-UNet repository
-from [here](https://github.com/MrBlankness/LightM-UNet) and follow the instructions provided in the repository.
-
-With SegMamba and LightM-UNet, you have a comprehensive toolkit for coronary arteries segmentation, empowering you to
-achieve state-of-the-art results.
+For UNet and Mamba-Encoder variants, see [LightM-UNet](https://github.com/MrBlankness/LightM-UNet).
